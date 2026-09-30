@@ -79,3 +79,55 @@ class PageStore:
         live = self._live()
         return {"pages": (self.path.stat().st_size + PAGE_SIZE - 1) // PAGE_SIZE if self.path.is_file() else 0,
                 "records": len(self._records()), "keys": len(live)}
+
+    @staticmethod
+    def _record_at(data: bytes, offset: int) -> dict | None:
+        """Parse one record at ``offset``; ``None`` when it is not whole and valid."""
+        size = len(data)
+        if offset + 4 > size:
+            return None
+        rec_size = int.from_bytes(data[offset:offset + 4], "big")
+        if offset + 4 + rec_size > size:
+            return None
+        try:
+            json.loads(data[offset + 4:offset + 4 + rec_size].decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+        return {"end": offset + 4 + rec_size}
+
+    def _has_record_after(self, data: bytes, offset: int) -> bool:
+        """Whether any valid record can be re-synchronised past ``offset``."""
+        return any(self._record_at(data, start) is not None
+                   for start in range(offset + 1, len(data) - 3))
+
+    def verify(self) -> dict:
+        """Read-only check of the page file; never mutates the store."""
+        result = {"status": "ok", "complete_records": 0, "valid_pages": 0,
+                  "first_error_offset": None, "tail_partial_bytes": 0,
+                  "scanned_end_offset": None, "error": None}
+        if not self.directory.is_dir() or not self.path.is_file():
+            result.update(status="error", error="invalid_path")
+            return result
+        try:
+            data = self.path.read_bytes()
+        except OSError:
+            result.update(status="error", error="read_error")
+            return result
+        size = len(data)
+        result["scanned_end_offset"] = size
+        offset = 0
+        while offset < size:
+            record = self._record_at(data, offset)
+            if record is None:
+                break
+            offset = record["end"]
+            result["complete_records"] += 1
+        result["valid_pages"] = offset // PAGE_SIZE
+        if offset == size:
+            return result
+        if self._has_record_after(data, offset):
+            result.update(status="corrupt_middle", error="corrupt_middle",
+                          first_error_offset=offset)
+        else:
+            result.update(status="incomplete_tail", tail_partial_bytes=size - offset)
+        return result

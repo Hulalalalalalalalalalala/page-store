@@ -1,6 +1,8 @@
 """Command line entry point: ``python3 -m page_store --root <dir> <subcommand>``.
 
 Exit codes: 0 success, 1 a storage or verification error, 2 a usage error.
+The read-only ``verify`` subcommand additionally uses 3 when the page file
+cannot be read and 4 when records follow a corrupt region.
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("recover", help="reopen the page file")
     sub.add_parser("stats", help="print page, record and key counts")
     sub.add_parser("report", help="print this domain's report as JSON")
+    sub.add_parser("verify", help="verify the page file read-only")
     return parser
 
 
@@ -78,6 +81,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(store.stats(), sort_keys=True))
         elif args.command == "report":
             print(_report(["pages", "directory"], {"append": True, "recover": True, "compaction": False, "snapshotRead": False}))
+        elif args.command == "verify":
+            outcome = store.verify()
+            print(json.dumps(outcome, sort_keys=True))
+            if outcome["status"] == "error":
+                print(f"error: {outcome['error']}: {store.path}", file=sys.stderr)
+                return USAGE_ERROR if outcome["error"] == "invalid_path" else 3
+            if outcome["status"] == "corrupt_middle":
+                print(f"error: corrupt record at offset {outcome['first_error_offset']}", file=sys.stderr)
+                return 4
         return 0
     except FileNotFoundError as error:
         print(f"error: {error}", file=sys.stderr)
