@@ -1,0 +1,4 @@
+# Every file in this repository is executed or read inside WSL from a Windows working copy.
+# A CRLF checkout would break the shebang of any shell script the acceptance author adds under
+# checks/, so force LF for the whole tree.
+* text=auto eol=lf
