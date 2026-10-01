@@ -71,9 +71,32 @@ class PageStore:
         return [(k, v) for k, v in items if (start is None or k >= start) and (end is None or k < end)]
 
     def recover(self) -> dict:
-        records = self._records()
-        return {"pages": (self.path.stat().st_size + PAGE_SIZE - 1) // PAGE_SIZE if self.path.is_file() else 0,
-                "records": len(records), "truncated": False}
+        """Reopen the page file, dropping a half-written tail record.
+
+        Records are scanned strictly along length-prefix boundaries.  The first
+        boundary that is not a whole, parseable record marks a half-written
+        tail: scanning stops and every byte from that boundary on is removed, so
+        later appends continue right after the last confirmed record.
+        """
+        if not self.directory.is_dir() or not self.path.is_file():
+            raise FileNotFoundError(f"no store at {self.path}; run init first")
+        data = self.path.read_bytes()
+        size = len(data)
+        offset, records = 0, 0
+        while offset < size:
+            record = self._record_at(data, offset)
+            if record is None:
+                break  # partial prefix, declared length past EOF, or bad payload
+            offset = record["end"]
+            records += 1
+        truncated = offset < size
+        if truncated:
+            with self.path.open("r+b") as handle:
+                handle.truncate(offset)
+                handle.flush()
+                os.fsync(handle.fileno())
+        return {"pages": (offset + PAGE_SIZE - 1) // PAGE_SIZE,
+                "records": records, "truncated": truncated}
 
     def stats(self) -> dict:
         live = self._live()
