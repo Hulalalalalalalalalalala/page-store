@@ -77,6 +77,11 @@ class PageStore:
         boundary that is not a whole, parseable record marks a half-written
         tail: scanning stops and every byte from that boundary on is removed, so
         later appends continue right after the last confirmed record.
+
+        If a complete record can still be re-synchronised past the stop offset,
+        the damage is mid-file corruption rather than a half-written tail:
+        ``RuntimeError("corrupt_middle")`` is raised and the file is left
+        byte-for-byte untouched.
         """
         if not self.directory.is_dir() or not self.path.is_file():
             raise FileNotFoundError(f"no store at {self.path}; run init first")
@@ -91,6 +96,8 @@ class PageStore:
             records += 1
         truncated = offset < size
         if truncated:
+            if self._has_record_after(data, offset):
+                raise RuntimeError("corrupt_middle")
             with self.path.open("r+b") as handle:
                 handle.truncate(offset)
                 handle.flush()

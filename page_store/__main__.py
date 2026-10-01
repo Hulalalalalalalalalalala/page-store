@@ -76,7 +76,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "scan":
             print(json.dumps(store.scan(args.start, args.end), ensure_ascii=False))
         elif args.command == "recover":
-            print(json.dumps(store.recover(), sort_keys=True))
+            try:
+                print(json.dumps(store.recover(), sort_keys=True))
+            except RuntimeError as error:
+                if str(error) != "corrupt_middle":
+                    raise
+                offset = store.verify()["first_error_offset"]
+                print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
+                return 1
         elif args.command == "stats":
             print(json.dumps(store.stats(), sort_keys=True))
         elif args.command == "report":
