@@ -15,6 +15,7 @@ from . import DOMAIN, SOURCE_CATEGORIES, __version__
 from .core import PageStore
 
 USAGE_ERROR = 2
+STORAGE_ERROR = 1
 
 def _tags() -> list[str]:
     """Tags this domain claims: the comma-separated line that follows each named category heading."""
@@ -56,6 +57,7 @@ def _parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan"); scan.add_argument("--start"); scan.add_argument("--end")
     sub.add_parser("recover", help="reopen the page file")
     sub.add_parser("stats", help="print page, record and key counts")
+    sub.add_parser("compact", help="rewrite live keys as ascending put records")
     sub.add_parser("report", help="print this domain's report as JSON")
     sub.add_parser("verify", help="verify the page file read-only")
     return parser
@@ -86,8 +88,24 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         elif args.command == "stats":
             print(json.dumps(store.stats(), sort_keys=True))
+        elif args.command == "compact":
+            try:
+                result = store.compact()
+            except FileNotFoundError:
+                print(f"error: no store at {store.path}", file=sys.stderr)
+                return STORAGE_ERROR
+            except RuntimeError as error:
+                if str(error) != "corrupt_middle":
+                    raise
+                offset = store.verify()["first_error_offset"]
+                print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
+                return STORAGE_ERROR
+            except OSError:
+                print("error: io_error", file=sys.stderr)
+                return STORAGE_ERROR
+            print(json.dumps(result))
         elif args.command == "report":
-            print(_report(["pages", "directory"], {"append": True, "recover": True, "compaction": False, "snapshotRead": False}))
+            print(_report(["pages", "directory"], {"append": True, "recover": True, "compaction": True, "snapshotRead": False}))
         elif args.command == "verify":
             outcome = store.verify()
             print(json.dumps(outcome, sort_keys=True))

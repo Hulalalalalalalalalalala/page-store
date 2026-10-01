@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -47,14 +48,19 @@ class PageStore:
         self.path.write_bytes(b"")
 
     def _append(self, record: dict) -> int:
-        payload = json.dumps(record, sort_keys=True).encode("utf-8")
-        if len(payload) > PAGE_SIZE:
-            raise ValueError(f"record exceeds one page ({len(payload)} > {PAGE_SIZE})")
+        frame = self._encode(record)
+        if len(frame) - 4 > PAGE_SIZE:
+            raise ValueError(f"record exceeds one page ({len(frame) - 4} > {PAGE_SIZE})")
         with self.path.open("ab") as handle:
-            handle.write(len(payload).to_bytes(4, "big") + payload)
+            handle.write(frame)
             handle.flush()
             os.fsync(handle.fileno())
-        return sum(1 for _ in self._records()) 
+        return sum(1 for _ in self._records())
+
+    @staticmethod
+    def _encode(record: dict) -> bytes:
+        payload = json.dumps(record, sort_keys=True).encode("utf-8")
+        return len(payload).to_bytes(4, "big") + payload
 
     def _records(self) -> list[dict]:
         if not self.path.is_file():
@@ -110,6 +116,70 @@ class PageStore:
                 live.pop(record["key"], None)
         pages = (self.path.stat().st_size + PAGE_SIZE - 1) // PAGE_SIZE
         return Snapshot(live, pages, len(records))
+
+    def compact(self) -> dict:
+        """Rewrite live key/value pairs as the fewest ascending ``put`` records.
+
+        Confirmed records are replayed strictly along length-prefix
+        boundaries.  Old values and delete records are discarded; a
+        half-written tail is discarded too.  The result is written to a
+        temporary file and atomically swapped in, so an interrupted
+        compaction leaves either the complete old file or the complete new
+        one -- never a mixture.
+
+        Raises ``FileNotFoundError`` when the root is missing, points at a
+        file, or ``pages.dat`` is absent; ``RuntimeError("corrupt_middle")``
+        when a complete record can still be found past a damaged region (the
+        file is left untouched); and ``OSError`` on read/write failures.
+        """
+        if not self.directory.is_dir() or not self.path.is_file():
+            raise FileNotFoundError(f"no store at {self.path}; run init first")
+        data = self.path.read_bytes()
+        size = len(data)
+        offset, records_before = 0, 0
+        live: dict[str, str] = {}
+        while offset < size:
+            record = self._record_at(data, offset)
+            if record is None:
+                break  # a half-written tail record is discarded
+            chunk = data[offset + 4:record["end"]]
+            decoded = json.loads(chunk.decode("utf-8"))
+            if decoded["op"] == "put":
+                live[decoded["key"]] = decoded["value"]
+            else:
+                live.pop(decoded["key"], None)
+            offset = record["end"]
+            records_before += 1
+        if offset < size and self._has_record_after(data, offset):
+            raise RuntimeError("corrupt_middle")  # leave the file untouched
+        discarded = size - offset
+        frames = [self._encode({"op": "put", "key": key, "value": live[key]})
+                  for key in sorted(live)]
+        pages_before = (size + PAGE_SIZE - 1) // PAGE_SIZE
+        new_size = sum(map(len, frames))
+        tmp = self.directory / f".{LOG_FILE}.compact.tmp"
+        try:
+            with tmp.open("wb") as handle:
+                handle.write(b"".join(frames))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+            dirfd = os.open(self.directory, os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
+        records_after = len(frames)
+        return {"pages_before": pages_before,
+                "pages_after": (new_size + PAGE_SIZE - 1) // PAGE_SIZE,
+                "records_before": records_before,
+                "records_after": records_after,
+                "keys": len(live),
+                "discarded_tail_bytes": discarded}
 
     def recover(self) -> dict:
         """Reopen the page file, dropping a half-written tail record.

@@ -14,7 +14,16 @@
 python3 -m page_store --root ./state init
 ```
 
-子命令：`init`、`put <key> <value>`、`get <key>`、`delete <key>`、`scan [--start S] [--end E]`、`recover`、`stats`、`report`、`verify`。
+子命令：`init`、`put <key> <value>`、`get <key>`、`delete <key>`、`scan [--start S] [--end E]`、`recover`、`stats`、`compact`、`report`、`verify`。
+
+`compact` 把存活键值重写为按键升序、数量最少的 `put` 记录（旧值与删除记录不落盘，半写尾记录一并丢弃），经临时文件原子替换 `pages.dat`：压缩中断后只留下完整旧文件或完整新文件，不会混合。相同存活状态生成相同的记录顺序与文件内容，压缩后首次 `put`/`delete` 的序号从新的完整记录数继续递增。成功时标准输出只写一行 JSON，字段固定且顺序为：
+
+- `pages_before` / `pages_after`：压缩前后占用页数（文件大小按 4096 向上取整）。
+- `records_before` / `records_after`：压缩前确认的完整记录数 / 压缩后记录数（等于存活键数）。
+- `keys`：存活键数。
+- `discarded_tail_bytes`：被丢弃的半写尾字节数（无尾部时为 0）。空存储六个字段全为 0。
+
+压缩失败时诊断只写标准错误并退出 1：root 不存在、指向文件或缺少 `pages.dat` 为 `error: no store at PATH`；中段损坏为 `error: corrupt_middle at offset N`（N 取 `verify` 的 `first_error_offset`，且文件保持不变）；读写失败为 `error: io_error`。
 
 `verify` 只读校验页文件，不改动数据，也不影响后续 `recover`、`stats`、`report`。它在标准输出只输出一行 JSON，字段固定为：
 
@@ -42,6 +51,7 @@ python3 -m page_store --root ./state init
   - `scan(start=None, end=None)` 按键升序返回 `list[tuple[str, str]]`，`start` 含、`end` 不含，省略边界为开放区间，`start >= end` 返回空列表。
   - `stats()` 返回 `{pages, records, keys}`，口径同存储的 `stats()`，且不随后续 put、delete、recover 变化。
 - `recover() -> dict` 重开页文件，返回 `{pages, records, truncated}`。
+- `compact() -> dict` 将存活键值原子重写为按键升序的最少 `put` 记录，返回 `{pages_before, pages_after, records_before, records_after, keys, discarded_tail_bytes}`；root 不存在、指向文件或缺少 `pages.dat` 时抛出 `FileNotFoundError`，中段损坏抛出 `RuntimeError("corrupt_middle")` 且文件不变，读写失败抛出 `OSError`。
 - `stats() -> dict` 返回页数、记录数与存活键数。
 - `verify() -> dict` 只读校验页文件，返回上述固定字段的 JSON 口径字典。
 
@@ -54,7 +64,6 @@ python3 -m page_store --root ./state init
 ## 限制
 
 - 没有页内二分查找，键索引常驻内存。
-- 未实现压缩与页回收。
 - 未实现并发写；快照读仅限同一进程、同一 `PageStore` 实例的只读使用。
 
 ## 语料
