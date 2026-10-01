@@ -41,7 +41,7 @@ python3 -m page_store --root ./state init
 
 `page_store.PageStore(root)`：
 
-- `init() -> None` 建立空存储（建目录是唯一允许自动创建路径的操作）。
+- `init() -> None` 建立空存储（建目录是唯一允许自动创建路径的操作）。每次成功 `init` 都是一次串行状态变更：经临时文件原子替换出全新的空 `pages.dat`，重置前的写入被清空、重置后确认的写入保留；同一目录下其他长期存活的实例或进程下一次读取、`stats`、`snapshot` 或追加写入即看到新状态，无须关闭重开或先 `recover`（即使新文件长度与重置前相同或更长）。重置后、首次写入前 `stats` 三项均为 0，首次 `put`/`delete` 返回 1，此后序号从当前完整记录数继续递增。
 - `put(key, value) -> int` 追加一条记录并返回记录序号。`key` 必须是非空字符串、`value` 必须是字符串，否则抛 `ValueError`。
 - `get(key) -> bytes | None` 读取最后一次写入的值。
 - `delete(key) -> int` 追加一条删除记录；`key` 必须是非空字符串，否则抛 `ValueError`。

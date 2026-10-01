@@ -79,9 +79,33 @@ class PageStore:
     def init(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         with self._locked(exclusive=True, require=False):
-            # Serialise the (re)creation with concurrent writers: the empty
-            # file becomes the new serial point under the same lock they use.
-            self.path.write_bytes(b"")
+            # Install a *fresh empty inode* rather than truncating the old one.
+            # A reset is a serial state change on equal footing with a compaction:
+            # other instances detect a new inode (independent of the file's new
+            # length) and rebuild from an empty image, so pre-reset writes can
+            # neither be resurrected from a long-lived cache nor shadow records
+            # appended after the reset -- even when the new file grows as long
+            # as or longer than the old one.  The temp file is fsynced and the
+            # swap is followed by a directory fsync, so an interrupted init
+            # leaves either the complete old file or the complete empty one.
+            tmp = self.directory / f".{LOG_FILE}.init.tmp"
+            try:
+                with tmp.open("wb") as handle:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, self.path)
+                dirfd = os.open(self.directory, os.O_RDONLY)
+                try:
+                    os.fsync(dirfd)
+                finally:
+                    os.close(dirfd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+                # The old file may or may not still be the one the cache was
+                # built from; force a full rescan on the next operation.
+                self._invalidate()
+                raise
             self._invalidate()
             self._resync()
 
