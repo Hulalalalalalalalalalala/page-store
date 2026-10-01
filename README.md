@@ -1,6 +1,6 @@
 # page-store
 
-键值写入追加到固定大小的页文件，内存中维护有序目录；重开时从页文件重建，半写页被丢弃。
+键值写入追加到固定大小的页文件，内存中维护有序目录；重开时从页文件重建，半写页被丢弃。同一目录可由同进程的多个 `PageStore` 实例或多个进程同时打开：目录下的协调文件 `.pages.dat.lock` 在读取或推进串行点时加文件锁，使并发结果等价于某一串行顺序。
 
 ## 依赖
 
@@ -41,12 +41,14 @@ python3 -m page_store --root ./state init
 
 `page_store.PageStore(root)`：
 
-- `init() -> None` 建立空存储。
-- `put(key, value) -> int` 追加一条记录并返回记录序号。
+- `init() -> None` 建立空存储（建目录是唯一允许自动创建路径的操作）。
+- `put(key, value) -> int` 追加一条记录并返回记录序号。`key` 必须是非空字符串、`value` 必须是字符串，否则抛 `ValueError`。
 - `get(key) -> bytes | None` 读取最后一次写入的值。
-- `delete(key) -> int` 追加一条删除记录。
+- `delete(key) -> int` 追加一条删除记录；`key` 必须是非空字符串，否则抛 `ValueError`。
 - `scan(start=None, end=None) -> list[tuple[bytes, bytes]]` 按键升序返回区间内的存活记录（半开区间）。
-- `snapshot() -> Snapshot` 捕获调用时刻的存活键值状态，得到只读快照；root 不存在、指向文件或缺少 `pages.dat` 时与其他读操作一样抛出 `FileNotFoundError`。
+
+多个实例/进程共享同一目录时，`put`、`delete`、`compact`、`recover` 在协调文件上互斥串行：并发结果等价于某次串行交织；每次成功的 `put`/`delete` 返回从当前记录数严格递增、不重复的记录序号，失败或未确认（进程崩溃）的调用不占号、不可见，其半写尾由下一次写入在确认边界截断，或由 `recover`/`compact` 丢弃；`pages.dat` 的完整记录不会被覆盖、撕裂或跳过。`get`、`scan`、`stats`、`snapshot` 持共享锁，只可能看到某一次串行操作变更前或变更后的完整状态。
+- `snapshot() -> Snapshot` 捕获调用时刻的存活键值状态，得到只读快照，捕获在协调锁内完成；root 不存在、指向文件或缺少 `pages.dat` 时与其他读操作一样抛出 `FileNotFoundError`。快照捕获后不随后续 put、delete、recover、compact（无论来自本实例还是其他进程）改变。
   - `get(key)` 返回该键在快照时刻最后一次 put 的值，已删除或从未写入返回 `None`。
   - `scan(start=None, end=None)` 按键升序返回 `list[tuple[str, str]]`，`start` 含、`end` 不含，省略边界为开放区间，`start >= end` 返回空列表。
   - `stats()` 返回 `{pages, records, keys}`，口径同存储的 `stats()`，且不随后续 put、delete、recover 变化。
@@ -64,7 +66,8 @@ python3 -m page_store --root ./state init
 ## 限制
 
 - 没有页内二分查找，键索引常驻内存。
-- 未实现并发写；快照读仅限同一进程、同一 `PageStore` 实例的只读使用。
+- 并发协调依赖同机文件锁（`fcntl.flock`，协调文件 `.pages.dat.lock`），仅适用于同一台机器上共享目录的实例与进程，不支持网络文件系统之外的多机协调。协调文件不计记录、不会被 `compact` 当作数据；删除后下次操作自动重建。
+- 快照读捕获的是本实例（及共享该目录的其他进程）在该时刻的完整串行点状态。
 
 ## 语料
 
