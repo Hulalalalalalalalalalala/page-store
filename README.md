@@ -37,6 +37,10 @@ python3 -m page_store --root ./state init
 - `get(key) -> bytes | None` 读取最后一次写入的值。
 - `delete(key) -> int` 追加一条删除记录。
 - `scan(start=None, end=None) -> list[tuple[bytes, bytes]]` 按键升序返回区间内的存活记录（半开区间）。
+- `snapshot() -> Snapshot` 捕获调用时刻的存活键值状态，得到只读快照；root 不存在、指向文件或缺少 `pages.dat` 时与其他读操作一样抛出 `FileNotFoundError`。
+  - `get(key)` 返回该键在快照时刻最后一次 put 的值，已删除或从未写入返回 `None`。
+  - `scan(start=None, end=None)` 按键升序返回 `list[tuple[str, str]]`，`start` 含、`end` 不含，省略边界为开放区间，`start >= end` 返回空列表。
+  - `stats()` 返回 `{pages, records, keys}`，口径同存储的 `stats()`，且不随后续 put、delete、recover 变化。
 - `recover() -> dict` 重开页文件，返回 `{pages, records, truncated}`。
 - `stats() -> dict` 返回页数、记录数与存活键数。
 - `verify() -> dict` 只读校验页文件，返回上述固定字段的 JSON 口径字典。
@@ -51,7 +55,7 @@ python3 -m page_store --root ./state init
 
 - 没有页内二分查找，键索引常驻内存。
 - 未实现压缩与页回收。
-- 未实现并发写与快照读。
+- 未实现并发写；快照读仅限同一进程、同一 `PageStore` 实例的只读使用。
 
 ## 语料
 

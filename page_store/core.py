@@ -6,10 +6,33 @@ import json
 import os
 from pathlib import Path
 
-__all__ = ["PageStore"]
+__all__ = ["PageStore", "Snapshot"]
 
 PAGE_SIZE = 4096
 LOG_FILE = "pages.dat"
+
+
+class Snapshot:
+    """A read-only view of a store's live keys fixed at one point in time.
+
+    The view keeps its own in-memory copy, so later puts, deletes and
+    recovery of the originating :class:`PageStore` never affect it.
+    """
+
+    def __init__(self, live: dict[str, str], pages: int, records: int) -> None:
+        self._live = dict(live)
+        self._stats = {"pages": pages, "records": records, "keys": len(live)}
+
+    def get(self, key: str) -> str | None:
+        return self._live.get(key)
+
+    def scan(self, start: str | None = None, end: str | None = None) -> list[tuple[str, str]]:
+        items = sorted(self._live.items())
+        return [(k, v) for k, v in items
+                if (start is None or k >= start) and (end is None or k < end)]
+
+    def stats(self) -> dict:
+        return dict(self._stats)
 
 
 class PageStore:
@@ -69,6 +92,24 @@ class PageStore:
     def scan(self, start: str | None = None, end: str | None = None) -> list[tuple[str, str]]:
         items = sorted(self._live().items())
         return [(k, v) for k, v in items if (start is None or k >= start) and (end is None or k < end)]
+
+    def snapshot(self) -> Snapshot:
+        """Capture the live key state at call time as an immutable read-only view.
+
+        Only records that are complete and confirmed at call time are seen; a
+        half-written tail record is discarded, just as by the live reads.
+        Raises ``FileNotFoundError`` like the other read operations when the
+        root is missing, points at a file, or ``pages.dat`` is absent.
+        """
+        records = self._records()
+        live: dict[str, str] = {}
+        for record in records:
+            if record["op"] == "put":
+                live[record["key"]] = record["value"]
+            else:
+                live.pop(record["key"], None)
+        pages = (self.path.stat().st_size + PAGE_SIZE - 1) // PAGE_SIZE
+        return Snapshot(live, pages, len(records))
 
     def recover(self) -> dict:
         """Reopen the page file, dropping a half-written tail record.
