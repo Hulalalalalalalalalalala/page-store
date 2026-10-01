@@ -94,6 +94,12 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except RuntimeError as error:
+        if str(error) == "corrupt_middle":
+            print(f"error: corrupt_middle at offset {error.offset}", file=sys.stderr)
+        else:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
     except (KeyError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return USAGE_ERROR
