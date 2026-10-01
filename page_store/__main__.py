@@ -55,6 +55,7 @@ def _parser() -> argparse.ArgumentParser:
     delete = sub.add_parser("delete"); delete.add_argument("key")
     scan = sub.add_parser("scan"); scan.add_argument("--start"); scan.add_argument("--end")
     sub.add_parser("recover", help="reopen the page file")
+    sub.add_parser("compact", help="rewrite live keys as a minimal sorted run")
     sub.add_parser("stats", help="print page, record and key counts")
     sub.add_parser("report", help="print this domain's report as JSON")
     sub.add_parser("verify", help="verify the page file read-only")
@@ -84,10 +85,25 @@ def main(argv: list[str] | None = None) -> int:
                 offset = store.verify()["first_error_offset"]
                 print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
                 return 1
+        elif args.command == "compact":
+            try:
+                print(json.dumps(store.compact()))
+            except FileNotFoundError:
+                print(f"error: no store at {store.path}", file=sys.stderr)
+                return 1
+            except RuntimeError as error:
+                if str(error) != "corrupt_middle":
+                    raise
+                offset = store.verify()["first_error_offset"]
+                print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
+                return 1
+            except OSError:
+                print("error: io_error", file=sys.stderr)
+                return 1
         elif args.command == "stats":
             print(json.dumps(store.stats(), sort_keys=True))
         elif args.command == "report":
-            print(_report(["pages", "directory"], {"append": True, "recover": True, "compaction": False, "snapshotRead": False}))
+            print(_report(["pages", "directory"], {"append": True, "recover": True, "compaction": True, "snapshotRead": False}))
         elif args.command == "verify":
             outcome = store.verify()
             print(json.dumps(outcome, sort_keys=True))

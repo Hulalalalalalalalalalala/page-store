@@ -14,7 +14,9 @@
 python3 -m page_store --root ./state init
 ```
 
-子命令：`init`、`put <key> <value>`、`get <key>`、`delete <key>`、`scan [--start S] [--end E]`、`recover`、`stats`、`report`、`verify`。
+子命令：`init`、`put <key> <value>`、`get <key>`、`delete <key>`、`scan [--start S] [--end E]`、`recover`、`compact`、`stats`、`report`、`verify`。
+
+`compact` 把存活键值重写为按键升序的最少 put 记录（丢弃旧值、删除记录与半写尾随），通过临时文件原子替换 `pages.dat`，中断后只留下完整旧状态或完整新状态。成功时标准输出只写一行 JSON，字段固定为 `pages_before`、`pages_after`、`records_before`、`records_after`、`keys`、`discarded_tail_bytes`；空存储全为 0。失败时只写标准错误并退出 1：root 不存在、指向文件或缺少 `pages.dat` 为 `error: no store at PATH`，中段损坏为 `error: corrupt_middle at offset N`（文件不变），读写失败为 `error: io_error`。
 
 `verify` 只读校验页文件，不改动数据，也不影响后续 `recover`、`stats`、`report`。它在标准输出只输出一行 JSON，字段固定为：
 
@@ -42,6 +44,7 @@ python3 -m page_store --root ./state init
   - `scan(start=None, end=None)` 按键升序返回 `list[tuple[str, str]]`，`start` 含、`end` 不含，省略边界为开放区间，`start >= end` 返回空列表。
   - `stats()` 返回 `{pages, records, keys}`，口径同存储的 `stats()`，且不随后续 put、delete、recover 变化。
 - `recover() -> dict` 重开页文件，返回 `{pages, records, truncated}`。
+- `compact() -> dict` 压缩页文件，返回上述固定字段的字典；错误语义同 CLI。
 - `stats() -> dict` 返回页数、记录数与存活键数。
 - `verify() -> dict` 只读校验页文件，返回上述固定字段的 JSON 口径字典。
 
@@ -54,7 +57,7 @@ python3 -m page_store --root ./state init
 ## 限制
 
 - 没有页内二分查找，键索引常驻内存。
-- 未实现压缩与页回收。
+- 压缩整体重写页文件，不做原地页回收。
 - 未实现并发写；快照读仅限同一进程、同一 `PageStore` 实例的只读使用。
 
 ## 语料

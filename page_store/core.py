@@ -146,6 +146,69 @@ class PageStore:
         return {"pages": (offset + PAGE_SIZE - 1) // PAGE_SIZE,
                 "records": records, "truncated": truncated}
 
+    def compact(self) -> dict:
+        """Rewrite the live keys as a minimal run of put records, key-ascending.
+
+        Only complete, confirmed records are considered: a half-written tail
+        is discarded and its byte count reported as ``discarded_tail_bytes``.
+        Old values and delete records are dropped, so the new file holds
+        exactly one put record per live key, sorted by key.  The same live
+        state always yields the same record order and the same ``pages.dat``
+        content.
+
+        The new content is written to a sibling temporary file, fsynced and
+        atomically renamed over ``pages.dat``, so an interrupted compaction
+        leaves either the complete old state or the complete new state,
+        never a mix.  Afterwards the record sequence continues from the new
+        complete-record count.
+
+        Raises ``FileNotFoundError`` when the root is missing, points at a
+        file, or ``pages.dat`` is absent; ``RuntimeError("corrupt_middle")``
+        (leaving the file untouched) when complete records follow a corrupt
+        region; and ``OSError`` on read or write failure.
+        """
+        if not self.directory.is_dir() or not self.path.is_file():
+            raise FileNotFoundError(f"no store at {self.path}; run init first")
+        data = self.path.read_bytes()
+        size = len(data)
+        offset, records = 0, []
+        while offset < size:
+            record = self._record_at(data, offset)
+            if record is None:
+                break  # partial prefix, declared length past EOF, or bad payload
+            records.append(json.loads(data[offset + 4:record["end"]].decode("utf-8")))
+            offset = record["end"]
+        if offset < size and self._has_record_after(data, offset):
+            raise RuntimeError("corrupt_middle")
+        live: dict[str, str] = {}
+        for record in records:
+            if record["op"] == "put":
+                live[record["key"]] = record["value"]
+            else:
+                live.pop(record["key"], None)
+        out = bytearray()
+        for key in sorted(live):
+            payload = json.dumps({"op": "put", "key": key, "value": live[key]},
+                                 sort_keys=True).encode("utf-8")
+            out += len(payload).to_bytes(4, "big") + payload
+        temporary = self.directory / (LOG_FILE + ".tmp")
+        with temporary.open("wb") as handle:
+            handle.write(bytes(out))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.path)
+        directory_fd = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return {"pages_before": (size + PAGE_SIZE - 1) // PAGE_SIZE,
+                "pages_after": (len(out) + PAGE_SIZE - 1) // PAGE_SIZE,
+                "records_before": len(records),
+                "records_after": len(live),
+                "keys": len(live),
+                "discarded_tail_bytes": size - offset}
+
     def stats(self) -> dict:
         live = self._live()
         return {"pages": (self.path.stat().st_size + PAGE_SIZE - 1) // PAGE_SIZE if self.path.is_file() else 0,
