@@ -6,10 +6,42 @@ import json
 import os
 from pathlib import Path
 
-__all__ = ["PageStore"]
+__all__ = ["PageStore", "Snapshot"]
 
 PAGE_SIZE = 4096
 LOG_FILE = "pages.dat"
+
+
+class Snapshot:
+    """A read-only view of a store's live keyspace fixed at one instant.
+
+    The snapshot replays only the complete-record prefix visible when it was
+    taken, so later puts, deletes or recovery on the owning store never reach
+    it.
+    """
+
+    def __init__(self, records: list[dict], pages: int) -> None:
+        live: dict[str, str] = {}
+        for record in records:
+            if record["op"] == "put":
+                live[record["key"]] = record["value"]
+            else:
+                live.pop(record["key"], None)
+        self._live = live
+        self._stats = {"pages": pages, "records": len(records), "keys": len(live)}
+
+    def get(self, key: str) -> str | None:
+        """Last put value at capture time; ``None`` if deleted or never written."""
+        return self._live.get(key)
+
+    def scan(self, start: str | None = None, end: str | None = None) -> list[tuple[str, str]]:
+        """Live keys in ascending order, half-open ``[start, end)``."""
+        items = sorted(self._live.items())
+        return [(k, v) for k, v in items if (start is None or k >= start) and (end is None or k < end)]
+
+    def stats(self) -> dict:
+        """Frozen ``{pages, records, keys}`` counts as of capture time."""
+        return dict(self._stats)
 
 
 class PageStore:
@@ -69,6 +101,17 @@ class PageStore:
     def scan(self, start: str | None = None, end: str | None = None) -> list[tuple[str, str]]:
         items = sorted(self._live().items())
         return [(k, v) for k, v in items if (start is None or k >= start) and (end is None or k < end)]
+
+    def snapshot(self) -> Snapshot:
+        """Capture a read-only view of the live keyspace as it is now.
+
+        Only the prefix of confirmed, complete records is replayed, so a
+        half-written tail is excluded exactly as in live reads.  Missing root
+        or page file raises ``FileNotFoundError`` like the other read paths.
+        """
+        records = self._records()
+        pages = (self.path.stat().st_size + PAGE_SIZE - 1) // PAGE_SIZE
+        return Snapshot(records, pages)
 
     def recover(self) -> dict:
         """Reopen the page file, dropping a half-written tail record.

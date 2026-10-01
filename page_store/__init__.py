@@ -8,6 +8,6 @@ DOMAIN = "storage-engine"
 #: Category headings in corpus.md whose tags this domain claims.
 SOURCE_CATEGORIES = ("🧮 数据库 / OLAP / OLTP", "🪶 数据存储 / 文件格式")
 
-from .core import PageStore  # noqa: E402  (re-exported after the constants above)
+from .core import PageStore, Snapshot  # noqa: E402  (re-exported after the constants above)
 
-__all__ = ["PageStore", "DOMAIN", "SOURCE_CATEGORIES", "__version__"]
+__all__ = ["PageStore", "Snapshot", "DOMAIN", "SOURCE_CATEGORIES", "__version__"]
