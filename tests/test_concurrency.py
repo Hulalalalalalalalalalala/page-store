@@ -352,6 +352,114 @@ class SnapshotAcrossInstancesTests(ConcurrencyTestBase):
                          [("a", "updated"), ("c", "3"), ("d", "4")])
 
 
+class ReinitVisibilityTests(ConcurrencyTestBase):
+    """A long-lived instance must observe another instance's init() reset.
+
+    init truncates pages.dat in place (same inode), so once the rewritten
+    file reaches the old length a stale cache can no longer be told apart
+    by size or inode alone.
+    """
+
+    def test_stale_instance_sees_reset_when_rewrite_reaches_old_length(self) -> None:
+        a, b = PageStore(self.root), PageStore(self.root)
+        a.put("old", "1")
+        a.put("old2", "2")
+        self.assertEqual(a.get("old"), "1")  # populate a's cache
+        length_before = len(self.data)
+        b.init()
+        # Rewrite enough that pages.dat is at least as long as before the
+        # reset: size alone cannot reveal the truncation.
+        seq = 1
+        while len(self.data) < length_before:
+            self.assertEqual(b.put(f"new{seq}", f"v{seq}"), seq)
+            seq += 1
+        self.assertIsNone(a.get("old"))
+        self.assertIsNone(a.get("old2"))
+        self.assertEqual(a.get("new1"), "v1")
+        fresh = PageStore(self.root)
+        self.assertEqual(a.scan(), fresh.scan())
+        self.assertEqual(a.stats(), fresh.stats())
+        self.assertEqual(a.snapshot().scan(), fresh.scan())
+
+    def test_repeated_resets_are_all_observed(self) -> None:
+        a, b = PageStore(self.root), PageStore(self.root)
+        for round_no in range(4):
+            b.init()
+            for i in range(round_no + 2):
+                self.assertEqual(b.put(f"r{round_no}-k{i}", f"{round_no}:{i}"), i + 1)
+            expected = [(f"r{round_no}-k{i}", f"{round_no}:{i}")
+                        for i in range(round_no + 2)]
+            self.assertEqual(a.scan(), expected)
+            self.assertEqual(a.stats()["records"], round_no + 2)
+            self.assertEqual(a.stats()["keys"], round_no + 2)
+            # a's own writes number from the current record count: no gaps,
+            # no skipped numbers, no revived keys from before the reset.
+            self.assertEqual(a.put(f"r{round_no}-a", "x"), round_no + 3)
+            self.assertEqual(b.get(f"r{round_no}-a"), "x")
+
+    def test_reset_to_empty_then_first_write_numbers_from_one(self) -> None:
+        a, b = PageStore(self.root), PageStore(self.root)
+        for i in range(5):
+            a.put(f"k{i}", "v")
+        a.stats()  # cache the non-empty state
+        b.init()
+        # Before any new write the store reads as empty for the stale instance.
+        self.assertEqual(a.stats(), {"pages": 0, "records": 0, "keys": 0})
+        self.assertEqual(a.scan(), [])
+        self.assertIsNone(a.get("k0"))
+        self.assertEqual(a.put("first", "1"), 1)
+        self.assertEqual(b.put("second", "2"), 2)
+        self.assertEqual(a.delete("first"), 3)
+        self.assertEqual(a.scan(), [("second", "2")])
+        self.assertEqual(b.stats(), {"pages": 1, "records": 3, "keys": 1})
+
+    def test_snapshot_from_before_reset_is_frozen_new_snapshot_reflects_reset(self) -> None:
+        a, b = PageStore(self.root), PageStore(self.root)
+        a.put("old", "1")
+        before = a.snapshot()
+        b.init()
+        b.put("new", "2")
+        self.assertEqual(before.scan(), [("old", "1")])
+        self.assertEqual(before.stats(), {"pages": 1, "records": 1, "keys": 1})
+        after = a.snapshot()
+        self.assertEqual(after.scan(), [("new", "2")])
+        self.assertEqual(after.stats(), {"pages": 1, "records": 1, "keys": 1})
+
+    def test_reset_by_separate_process_is_observed(self) -> None:
+        a = PageStore(self.root)
+        a.put("old", "1")
+        a.put("old2", "2")
+        a.get("old")  # populate the cache
+        for command in (["init"], ["put", "new", "3"], ["put", "new2", "4"]):
+            proc = subprocess.run(
+                [sys.executable, "-m", "page_store", "--root", str(self.root),
+                 *command],
+                cwd=REPO_ROOT, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(a.get("old"))
+        self.assertEqual(a.get("new"), "3")
+        self.assertEqual(a.scan(), [("new", "3"), ("new2", "4")])
+        self.assertEqual(a.stats()["records"], 2)
+        # Appends from the stale instance continue the current numbering.
+        self.assertEqual(a.put("third", "5"), 3)
+
+    def test_compact_after_reset_seen_by_stale_instance(self) -> None:
+        a, b = PageStore(self.root), PageStore(self.root)
+        a.put("old", "1")
+        a.stats()
+        b.init()
+        b.put("x", "1")
+        b.put("x", "2")
+        b.delete("x")
+        b.put("y", "3")
+        result = a.compact()
+        self.assertEqual(result["records_before"], 4)
+        self.assertEqual(result["records_after"], 1)
+        self.assertEqual(a.scan(), [("y", "3")])
+        self.assertEqual(b.put("z", "4"), 2)
+        self.assertEqual(a.scan(), [("y", "3"), ("z", "4")])
+
+
 class ValidationTests(ConcurrencyTestBase):
     def test_put_and_delete_reject_bad_keys_and_values(self) -> None:
         for bad in (None, 1, b"k", "", object()):

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import threading
@@ -67,11 +68,13 @@ class PageStore:
         self._gate = threading.RLock()
         self._lock_fd: int | None = None
         # Cached serial point: live directory, next sequence number (= number
-        # of confirmed records), offset just past those records, and the
-        # identity of the file they were read from.
+        # of confirmed records), offset just past those records, a running
+        # hash of the confirmed prefix, and the identity of the file they
+        # were read from.
         self._live: dict[str, str] | None = None
         self._seq = 0
         self._end = 0
+        self._prefix_hash = None  # hashlib hash of data[:_end], set with _live
         self._identity: tuple[int, int, int, int, int] | None = None
 
     # ------------------------------------------------------------------ init
@@ -125,6 +128,7 @@ class PageStore:
 
     def _invalidate(self) -> None:
         self._live = None
+        self._prefix_hash = None
         self._identity = None
 
     @staticmethod
@@ -167,25 +171,41 @@ class PageStore:
         been replaced (another instance compacted) the whole image is read;
         otherwise only bytes past the previously confirmed offset are replayed,
         which also discards a half-written tail left by a crashed writer.
+
+        A reset by another instance's ``init`` truncates the same inode in
+        place, so it is neither a replacement nor (once rewriting reaches the
+        old boundary) a shrink.  It is detected by hashing the confirmed
+        prefix: if the bytes up to the last confirmed offset no longer match
+        what this cache was built from, the serial point is rebuilt from the
+        beginning instead of replaying the new file's tail onto stale keys.
         """
         self._require_store()
         identity = self._identity_of()
+        if self._live is not None and identity == self._identity:
+            return  # no append, compaction or reset since the last sync
         data = self.path.read_bytes()
         replaced = self._live is None or self._identity is None or \
             identity[:2] != self._identity[:2]
+        if not replaced and len(data) >= self._end and \
+                hashlib.sha256(data[:self._end]).digest() != self._prefix_hash.digest():
+            replaced = True  # another instance re-initialised the store
         if replaced or len(data) < self._end:
-            # New file (another instance compacted) or an externally
-            # truncated inode: rebuild the serial point from the beginning.
+            # New file (another instance compacted or re-initialised) or an
+            # externally truncated inode: rebuild from the beginning.
             live: dict[str, str] = {}
             offset, count = self._scan_from(data, 0, live)
             self._live = live
             self._seq = count
+            self._prefix_hash = hashlib.sha256(data[:offset])
             self._end = offset
         else:
-            # Same inode: replay only what other processes appended beyond the
-            # last confirmed boundary (including an earlier half-write).
-            offset, count = self._scan_from(data, self._end, self._live)
+            # Same inode, same confirmed prefix: replay only what other
+            # processes appended beyond the last confirmed boundary
+            # (including an earlier half-write).
+            old_end = self._end
+            offset, count = self._scan_from(data, old_end, self._live)
             self._seq += count
+            self._prefix_hash.update(data[old_end:offset])
             self._end = offset
         self._identity = identity
 
@@ -248,6 +268,7 @@ class PageStore:
                 self._live.pop(decoded["key"], None)
             self._seq += 1
             self._end += len(frame)
+            self._prefix_hash.update(frame)
             try:
                 self._identity = self._identity_of()
             except OSError:
@@ -352,9 +373,10 @@ class PageStore:
             pages_before = (size + PAGE_SIZE - 1) // PAGE_SIZE
             new_size = sum(map(len, frames))
             tmp = self.directory / f".{LOG_FILE}.compact.tmp"
+            payload = b"".join(frames)
             try:
                 with tmp.open("wb") as handle:
-                    handle.write(b"".join(frames))
+                    handle.write(payload)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(tmp, self.path)
@@ -374,6 +396,7 @@ class PageStore:
             self._live = dict(live)
             self._seq = len(frames)
             self._end = new_size
+            self._prefix_hash = hashlib.sha256(payload)
             self._identity = self._identity_of()
             records_after = len(frames)
             return {"pages_before": pages_before,
@@ -425,6 +448,7 @@ class PageStore:
             self._live = live
             self._seq = records
             self._end = offset
+            self._prefix_hash = hashlib.sha256(data[:offset])
             self._identity = self._identity_of()
             return {"pages": (offset + PAGE_SIZE - 1) // PAGE_SIZE,
                     "records": records, "truncated": truncated}
