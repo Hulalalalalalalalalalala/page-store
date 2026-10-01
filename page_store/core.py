@@ -71,9 +71,25 @@ class PageStore:
         return [(k, v) for k, v in items if (start is None or k >= start) and (end is None or k < end)]
 
     def recover(self) -> dict:
-        records = self._records()
-        return {"pages": (self.path.stat().st_size + PAGE_SIZE - 1) // PAGE_SIZE if self.path.is_file() else 0,
-                "records": len(records), "truncated": False}
+        if not self.directory.is_dir() or not self.path.is_file():
+            raise FileNotFoundError(f"no store at {self.path}; run init first")
+        data = self.path.read_bytes()
+        size = len(data)
+        offset, records = 0, 0
+        while offset < size:
+            record = self._record_at(data, offset)
+            if record is None:
+                break  # half-written tail: partial prefix or payload
+            offset = record["end"]
+            records += 1
+        truncated = offset < size
+        if truncated:
+            with self.path.open("r+b") as handle:
+                handle.truncate(offset)
+                handle.flush()
+                os.fsync(handle.fileno())
+        return {"pages": (offset + PAGE_SIZE - 1) // PAGE_SIZE,
+                "records": records, "truncated": truncated}
 
     def stats(self) -> dict:
         live = self._live()
