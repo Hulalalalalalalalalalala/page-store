@@ -4,9 +4,10 @@ Several :class:`PageStore` instances -- in one process or in several -- may
 share the same root directory.  A coordination file next to ``pages.dat``
 (``.pages.dat.lock``) is locked while the serial point is read or moved, so
 the outcome of concurrent writers is equivalent to running their calls one
-after another: each successful put/delete gets a strictly increasing record
-sequence number, a failed or unconfirmed call never consumes a number, and
-readers always see a complete before/after state.
+after another: each successful put/delete (and every operation of a successful
+batch) gets a strictly increasing record sequence number, a failed or
+unconfirmed call -- including a whole unconfirmed batch -- never consumes a
+number, and readers always see a complete before/after state.
 """
 
 from __future__ import annotations
@@ -155,40 +156,93 @@ class PageStore:
     def _record_at(data: bytes, offset: int) -> tuple[int, dict] | None:
         """Parse one record at ``offset``.
 
-        A record is a four-byte big-endian length prefix followed by 1..4096
-        UTF-8 bytes encoding a JSON object whose ``op`` is ``"put"`` or
-        ``"delete"`` and whose ``key`` is a non-empty string; a ``put`` record
-        additionally carries a string ``value``.  A ``delete`` ignores its
-        ``value`` and both ops ignore every other field.  Anything else -- a
-        partial prefix, a declared length past EOF or outside 1..4096, a bad
-        UTF-8 or JSON payload, a scalar/array payload, an unknown op, or a
-        missing/invalid ``key``/``value`` -- is a break in the stream rather
-        than a record, so callers treat it exactly like a half-written tail and
-        never let a ``KeyError``/``TypeError`` escape.  Returns the boundary
-        just past the record and its decoded object, or ``None``.
+        A record is a four-byte big-endian length prefix followed by UTF-8
+        bytes encoding a JSON object.  A bare record's payload is 1..4096
+        bytes and its ``op`` is ``"put"`` or ``"delete"``; a ``put`` record
+        carries a string ``value`` and a ``delete`` does not.  A batch
+        record's ``op`` is ``"batch"`` and its ``ops`` is a non-empty list
+        of those same put/delete objects; a batch frame may span several
+        pages, so its payload is bounded only by the declared length rather
+        than one page.  A ``delete`` ignores its ``value`` and bare ops
+        ignore every other field.  Anything else -- a partial prefix, a
+        declared length past EOF, a bare-record length outside 1..4096, bad
+        UTF-8 or JSON, a scalar/array payload, an unknown op, a malformed
+        batch, or a missing/invalid ``key``/``value`` -- is a break in the
+        stream rather than a record, so callers treat it exactly like a
+        half-written tail and never let a ``KeyError``/``TypeError`` escape.
+        Returns the boundary just past the record and its decoded object, or
+        ``None``.
         """
         size = len(data)
         if offset + 4 > size:
             return None
         rec_size = int.from_bytes(data[offset:offset + 4], "big")
-        if not 1 <= rec_size <= PAGE_SIZE or offset + 4 + rec_size > size:
+        end = offset + 4 + rec_size
+        if rec_size < 1 or end > size:
             return None
         try:
-            decoded = json.loads(
-                data[offset + 4:offset + 4 + rec_size].decode("utf-8"))
+            decoded = json.loads(data[offset + 4:end].decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             return None
         if not isinstance(decoded, dict):
             return None
         op = decoded.get("op")
+        if op == "batch":
+            ops = decoded.get("ops")
+            if not isinstance(ops, list) or not ops:
+                return None
+            for item in ops:
+                if not PageStore._valid_item(item):
+                    return None
+            return end, decoded
         if op not in ("put", "delete"):
+            return None
+        # Bare put/delete records stay bounded to one page.
+        if rec_size > PAGE_SIZE:
             return None
         key = decoded.get("key")
         if not isinstance(key, str) or not key:
             return None
         if op == "put" and not isinstance(decoded.get("value"), str):
             return None
-        return offset + 4 + rec_size, decoded
+        return end, decoded
+
+    @staticmethod
+    def _valid_item(item: object) -> bool:
+        """Whether ``item`` is an exact put/delete operation dictionary."""
+        if not isinstance(item, dict):
+            return False
+        op = item.get("op")
+        if op == "put":
+            if set(item) != {"op", "key", "value"}:
+                return False
+            return isinstance(item["key"], str) and bool(item["key"]) \
+                and isinstance(item["value"], str)
+        if op == "delete":
+            if set(item) != {"op", "key"}:
+                return False
+            return isinstance(item["key"], str) and bool(item["key"])
+        return False
+
+    @staticmethod
+    def _apply(live: dict[str, str], decoded: dict) -> int:
+        """Replay one decoded record into ``live``; return its record count.
+
+        A bare put/delete counts once; a batch applies its operations in
+        order without merging and counts one per operation.
+        """
+        if decoded["op"] != "batch":
+            if decoded["op"] == "put":
+                live[decoded["key"]] = decoded["value"]
+            else:
+                live.pop(decoded["key"], None)
+            return 1
+        for item in decoded["ops"]:
+            if item["op"] == "put":
+                live[item["key"]] = item["value"]
+            else:
+                live.pop(item["key"], None)
+        return len(decoded["ops"])
 
     @classmethod
     def _record_past(cls, data: bytes, offset: int) -> bool:
@@ -199,10 +253,26 @@ class PageStore:
         the damaged region proves nothing.  The first offsets tried immediately
         after the break also cover the case where the frame's own declared
         length runs past EOF (its whole payload region is searched).
+
+        Batch frames may span several pages, so the scan is O(n) cheap prefix
+        checks: the full JSON decode runs only when the declared length fits
+        and either stays within one page (a bare put/delete frame) or the
+        payload opens like a JSON object carrying an ``op`` member, which a
+        batch object must do within its first bytes.
         """
         size = len(data)
-        return any(cls._record_at(data, start) is not None
-                   for start in range(offset + 1, size - 3))
+        for start in range(offset + 1, size - 3):
+            rec_size = int.from_bytes(data[start:start + 4], "big")
+            end = start + 4 + rec_size
+            if rec_size < 1 or end > size:
+                continue
+            if rec_size > PAGE_SIZE:
+                head = data[start + 4:start + 4 + 32]
+                if not head.lstrip().startswith(b"{") or b'"op"' not in head:
+                    continue
+            if cls._record_at(data, start) is not None:
+                return True
+        return False
 
     def _scan_from(self, data: bytes, offset: int,
                    live: dict[str, str]) -> tuple[int, int]:
@@ -218,13 +288,8 @@ class PageStore:
             parsed = self._record_at(data, offset)
             if parsed is None:
                 break
-            end, decoded = parsed
-            if decoded["op"] == "put":
-                live[decoded["key"]] = decoded["value"]
-            else:
-                live.pop(decoded["key"], None)
-            offset = end
-            count += 1
+            offset, decoded = parsed
+            count += self._apply(live, decoded)
         return offset, count
 
     def _resync(self) -> None:
@@ -269,10 +334,16 @@ class PageStore:
         payload = json.dumps(record, sort_keys=True).encode("utf-8")
         return len(payload).to_bytes(4, "big") + payload
 
-    def _append(self, record: dict) -> int:
+    def _append_record(self, record: dict, count: int) -> list[int]:
+        """Append one already-validated frame covering ``count`` records.
+
+        Returns the consecutive sequence numbers assigned to those records,
+        starting at one past the number of confirmed records.  A bare
+        put/delete passes ``count == 1``; a batch frame passes the length of
+        its operation list, and the whole frame lands -- or is rolled back --
+        as one serial point, so a crash keeps either all of it or none.
+        """
         frame = self._encode(record)
-        if len(frame) - 4 > PAGE_SIZE:
-            raise ValueError(f"record exceeds one page ({len(frame) - 4} > {PAGE_SIZE})")
         with self._locked(exclusive=True):
             # Another process may have appended or compacted since we last
             # synced; bring the serial point up to date first.
@@ -310,17 +381,15 @@ class PageStore:
                 self._invalidate()
                 raise
             # Confirmed: the append is now part of the serial point.
-            if record["op"] == "put":
-                self._live[record["key"]] = record["value"]
-            else:
-                self._live.pop(record["key"], None)
-            self._seq += 1
+            first = self._seq + 1
+            self._apply(self._live, record)
+            self._seq += count
             self._end += len(frame)
             try:
                 self._identity = self._identity_of()
             except OSError:
                 self._invalidate()
-            return self._seq
+            return list(range(first, first + count))
 
     @staticmethod
     def _check_key(key: object) -> None:
@@ -331,11 +400,62 @@ class PageStore:
         self._check_key(key)
         if not isinstance(value, str):
             raise ValueError("value must be a string")
-        return self._append({"op": "put", "key": key, "value": value})
+        record = {"op": "put", "key": key, "value": value}
+        payload_size = len(self._encode(record)) - 4
+        if payload_size > PAGE_SIZE:
+            raise ValueError(
+                f"record exceeds one page ({payload_size} > {PAGE_SIZE})")
+        return self._append_record(record, 1)[0]
 
     def delete(self, key: str) -> int:
         self._check_key(key)
-        return self._append({"op": "delete", "key": key})
+        return self._append_record({"op": "delete", "key": key}, 1)[0]
+
+    def write_batch(self, operations: list[dict]) -> list[int]:
+        """Atomically append a non-empty batch of put/delete operations.
+
+        Each element is an operation dict: a put has exactly the keys
+        ``op``, ``key`` and ``value``; a delete has exactly ``op`` and
+        ``key``.  Keys are non-empty strings and values are strings; every
+        single operation must fit the existing one-record size limit.  The
+        whole list is validated -- without touching the page file or
+        consuming a sequence number -- before anything is stored.
+
+        The batch takes effect as one serial point, operations applied in
+        input order (duplicate keys are not merged and deleting a missing
+        key still takes a number).  It may span several pages and is stored
+        as one frame, so a failed write or a process crash leaves either the
+        entire batch or none of it: an unconfirmed batch is a half-written
+        tail on reopen and is discarded by the next write or ``recover``.
+        Returns the operations' consecutive sequence numbers, starting at
+        one past the current number of confirmed records.
+
+        Raises ``ValueError`` for any malformed batch or oversized
+        operation, ``FileNotFoundError`` when the root is missing, points
+        at a file, or ``pages.dat`` is absent, ``RuntimeError
+        ("corrupt_middle")`` when damage precedes complete records (the
+        file is left untouched), and ``OSError`` on other read/write
+        failures.
+        """
+        if not isinstance(operations, list) or not operations:
+            raise ValueError("operations must be a non-empty list")
+        normalized: list[dict] = []
+        for item in operations:
+            if not self._valid_item(item):
+                raise ValueError(
+                    "each operation must be a dict with op 'put' "
+                    "(keys op, key, value) or 'delete' (keys op, key); "
+                    "key must be a non-empty string and value a string")
+            record = {"op": item["op"], "key": item["key"]}
+            if item["op"] == "put":
+                record["value"] = item["value"]
+            if len(self._encode(record)) - 4 > PAGE_SIZE:
+                raise ValueError(
+                    "an operation in the batch exceeds the one-record "
+                    f"size limit ({PAGE_SIZE} bytes)")
+            normalized.append(record)
+        return self._append_record({"op": "batch", "ops": normalized},
+                                   len(normalized))
 
     # -------------------------------------------------------------- reading
 
@@ -404,13 +524,8 @@ class PageStore:
                 parsed = self._record_at(data, offset)
                 if parsed is None:
                     break  # the continuous valid prefix ends here
-                end, decoded = parsed
-                if decoded["op"] == "put":
-                    live[decoded["key"]] = decoded["value"]
-                else:
-                    live.pop(decoded["key"], None)
-                offset = end
-                records_before += 1
+                offset, decoded = parsed
+                records_before += self._apply(live, decoded)
             if offset < size and self._record_past(data, offset):
                 raise RuntimeError("corrupt_middle")  # leave the file untouched
             discarded = size - offset
@@ -479,13 +594,8 @@ class PageStore:
                 if parsed is None:
                     break  # partial prefix, declared length past EOF/out of
                            # range, bad encoding/JSON, or an invalid payload
-                end, decoded = parsed
-                if decoded["op"] == "put":
-                    live[decoded["key"]] = decoded["value"]
-                else:
-                    live.pop(decoded["key"], None)
-                offset = end
-                records += 1
+                offset, decoded = parsed
+                records += self._apply(live, decoded)
             truncated = offset < size
             if truncated:
                 if self._record_past(data, offset):
@@ -520,12 +630,15 @@ class PageStore:
         size = len(data)
         result["scanned_end_offset"] = size
         offset = 0
+        replay: dict[str, str] = {}
         while offset < size:
             parsed = self._record_at(data, offset)
             if parsed is None:
                 break
-            offset = parsed[0]
-            result["complete_records"] += 1
+            offset, decoded = parsed
+            # A batch frame counts as one retained record per operation;
+            # its wrapper metadata never counts.
+            result["complete_records"] += self._apply(replay, decoded)
         result["valid_pages"] = offset // PAGE_SIZE
         if offset == size:
             return result

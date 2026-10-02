@@ -45,9 +45,10 @@ python3 -m page_store --root ./state init
 - `put(key, value) -> int` 追加一条记录并返回记录序号。`key` 必须是非空字符串、`value` 必须是字符串，否则抛 `ValueError`。
 - `get(key) -> bytes | None` 读取最后一次写入的值。
 - `delete(key) -> int` 追加一条删除记录；`key` 必须是非空字符串，否则抛 `ValueError`。
+- `write_batch(operations) -> list[int]` 原子追加一批 put/delete 操作。`operations` 必须是非空列表，每个元素是操作字典：put 恰含 `op`/`key`/`value` 三个字段，delete 恰含 `op`/`key` 两个字段；`key` 是非空字符串、`value` 是字符串，且每条单操作的 JSON 负载都不超过既有的单条大小限制（4096 字节）。非列表、空列表、非字典元素、未知操作、字段缺失或多余、非法键值、单条超限均抛 `ValueError`。整批校验先于任何存储操作：校验失败时页文件与序号都不变。有效批次按输入顺序作为**一个串行点**整体生效，重复键不合并、删除不存在的键也占一个序号；返回与操作逐项对应的连续整数序号，从当前完整记录数加一开始。整批以一帧落盘、可跨多个页，因此写入失败或进程被杀后重开只可能整批保留或整批不存在——未确认的批次就是半写尾，不占序号，由下一次写入在确认边界截断或由 `recover`/`compact` 丢弃；成功返回后全部操作已持久化。
 - `scan(start=None, end=None) -> list[tuple[bytes, bytes]]` 按键升序返回区间内的存活记录（半开区间）。
 
-多个实例/进程共享同一目录时，`put`、`delete`、`compact`、`recover` 在协调文件上互斥串行：并发结果等价于某次串行交织；每次成功的 `put`/`delete` 返回从当前记录数严格递增、不重复的记录序号，失败或未确认（进程崩溃）的调用不占号、不可见，其半写尾由下一次写入在确认边界截断，或由 `recover`/`compact` 丢弃；`pages.dat` 的完整记录不会被覆盖、撕裂或跳过。`get`、`scan`、`stats`、`snapshot` 持共享锁，只可能看到某一次串行操作变更前或变更后的完整状态。
+多个实例/进程共享同一目录时，`put`、`delete`、`write_batch`、`compact`、`recover` 在协调文件上互斥串行：并发结果等价于某次串行交织；每次成功的 `put`/`delete` 及成功批次中的每条操作返回从当前记录数严格递增、不重复的记录序号，失败或未确认（进程崩溃）的调用——包括整个未确认批次——不占号、不可见，其半写尾由下一次写入在确认边界截断，或由 `recover`/`compact` 丢弃；`pages.dat` 的完整记录不会被覆盖、撕裂或跳过。`get`、`scan`、`stats`、`snapshot` 持共享锁，只可能看到某一次串行操作（含整个批次）变更前或变更后的完整状态，绝不会看到批次内部的中间状态。旧存储（仅含 put/delete 帧的页文件）无需迁移即可使用，批次也不会隐式压缩历史。
 - `snapshot() -> Snapshot` 捕获调用时刻的存活键值状态，得到只读快照，捕获在协调锁内完成；root 不存在、指向文件或缺少 `pages.dat` 时与其他读操作一样抛出 `FileNotFoundError`。快照捕获后不随后续 put、delete、recover、compact（无论来自本实例还是其他进程）改变。
   - `get(key)` 返回该键在快照时刻最后一次 put 的值，已删除或从未写入返回 `None`。
   - `scan(start=None, end=None)` 按键升序返回 `list[tuple[str, str]]`，`start` 含、`end` 不含，省略边界为开放区间，`start >= end` 返回空列表。
@@ -60,6 +61,7 @@ python3 -m page_store --root ./state init
 ## 约定
 
 - 所有写操作立即持久化；进程被杀死后 `recover`/`init` 之外的重开不得丢失已确认的写。
+- `stats`、`recover`、`verify` 的记录计数按已保留的操作条数计算：一个批次贡献其操作条数，批次包装帧本身不计数；页数仍按文件大小以 4096 向上取整的原口径计算。`verify` 保持只读，半写尾（含半写的批次帧）仍报 `incomplete_tail`；`compact` 仍把存活键值重写为最少的升序 put 记录，压缩后的序号从压缩后记录数继续，批次不会触发隐式压缩。
 - 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`。
 - 退出码：0 成功，1 存储或校验错误，2 用法错误；`verify` 另用 3 表示页文件无法读取、4 表示中段损坏。
 
