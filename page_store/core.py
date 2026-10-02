@@ -8,6 +8,15 @@ after another: each successful put/delete (and every operation of a successful
 batch) gets a strictly increasing record sequence number, a failed or
 unconfirmed call -- including a whole unconfirmed batch -- never consumes a
 number, and readers always see a complete before/after state.
+
+Instances also survive ``fork`` (``os.fork`` and the multiprocessing ``fork``
+start): a forked child keeps using the very objects it inherited, with no
+rebuild or ``recover`` required.  Right after the fork the child drops the
+lock file descriptor and threading primitives it copied from the parent --
+which may carry a lock held by a thread the child never received -- and opens
+its own fresh descriptor, so the child can only wait for storage operations
+that a live parent thread or process is actually still holding; those are
+released when the operation completes or the holder exits.
 """
 
 from __future__ import annotations
@@ -17,6 +26,7 @@ import fcntl
 import json
 import os
 import threading
+import weakref
 from pathlib import Path
 
 __all__ = ["PageStore", "Snapshot"]
@@ -24,6 +34,54 @@ __all__ = ["PageStore", "Snapshot"]
 PAGE_SIZE = 4096
 LOG_FILE = "pages.dat"
 LOCK_FILE = f".{LOG_FILE}.lock"
+
+# --------------------------------------------------------------------- fork
+#
+# A forked child inherits every PageStore's coordination-file descriptor and
+# gate lock.  The descriptor is a duplicate of the parent's open file
+# description: if a parent thread held the flock at fork time, that lock is
+# owned by a thread the child never received -- a child that kept using the
+# inherited descriptor could block on it forever, and the inherited RLock may
+# look held by a thread that does not exist in the child either.  The
+# at-fork child hook resets every live instance before user code runs again;
+# flock is tied to the open file description (not the pid), so closing the
+# child's duplicate never disturbs a lock the parent genuinely still holds,
+# while any lock of a process that exits is released by the kernel.
+
+_INSTANCES: "set[weakref.ReferenceType[PageStore]]" = set()
+_REGISTRY_LOCK = threading.RLock()
+
+
+def _drop_instance(ref: "weakref.ReferenceType[PageStore]") -> None:
+    with _REGISTRY_LOCK:
+        _INSTANCES.discard(ref)
+
+
+def _before_fork() -> None:
+    # Held across the fork so the registry cannot change underneath the
+    # single thread that survives in the child.
+    _REGISTRY_LOCK.acquire()
+
+
+def _after_fork_parent() -> None:
+    _REGISTRY_LOCK.release()
+
+
+def _after_fork_child() -> None:
+    global _REGISTRY_LOCK
+    # The copied lock may appear owned by a thread that stayed in the parent;
+    # start with a fresh, uncontended one instead of trying to release it.
+    _REGISTRY_LOCK = threading.RLock()
+    for ref in list(_INSTANCES):
+        store = ref()
+        if store is not None:
+            store._reset_after_fork()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_before_fork,
+                        after_in_parent=_after_fork_parent,
+                        after_in_child=_after_fork_child)
 
 
 class Snapshot:
@@ -67,6 +125,9 @@ class PageStore:
         # cached serial-point state.
         self._gate = threading.RLock()
         self._lock_fd: int | None = None
+        # The pid this instance has been prepared for; it differs after a
+        # fork (see _after_fork_child / _reset_after_fork).
+        self._pid = os.getpid()
         # Cached serial point: live directory, next sequence number (= number
         # of confirmed records), offset just past those records, and the
         # identity of the file they were read from.
@@ -74,6 +135,49 @@ class PageStore:
         self._seq = 0
         self._end = 0
         self._identity: tuple[int, int, int, int, int] | None = None
+        with _REGISTRY_LOCK:
+            _INSTANCES.add(weakref.ref(self, _drop_instance))
+
+    def _reset_after_fork(self) -> None:
+        """Detach this copied instance from the forking process's resources.
+
+        Runs in the child immediately after a fork (and lazily via
+        :meth:`_ensure_pid` if the hook somehow did not run).  The inherited
+        coordination-file descriptor is closed without being unlocked and the
+        gate is replaced: the descriptor shares the parent's open file
+        description and the gate may be held by a thread the child never
+        received.  The cached serial point is dropped too, since the parent
+        (or a sibling) may move it while the child is alive; the first call
+        rebuilds it under the child's own coordination lock.
+        """
+        fd = self._lock_fd
+        self._lock_fd = None
+        if fd is not None:
+            # Closing this duplicate never releases a lock the parent still
+            # holds: an flock lives on the shared open file description and is
+            # released only once *all* its duplicates are closed (the parent
+            # keeps its own).  It must not be unlocked explicitly, since
+            # LOCK_UN on any duplicate would release the parent's live lock.
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._gate = threading.RLock()
+        self._live = None
+        self._seq = 0
+        self._end = 0
+        self._identity = None
+        self._pid = os.getpid()
+
+    def _ensure_pid(self) -> None:
+        """Repair the instance if it finds itself in a different process.
+
+        Belt-and-braces behind the ``register_at_fork`` hook: an instance
+        created before the fork module was wired up, or a fork path that
+        bypassed the hook, is repaired on its first locked section.  This is
+        only safe to call when no other thread in *this* process can be
+        inside the instance (e.g. the single surviving forking thread).
+        """
+        if self._pid != os.getpid():
+            self._reset_after_fork()
 
     # ------------------------------------------------------------------ init
 
@@ -115,6 +219,7 @@ class PageStore:
     @contextlib.contextmanager
     def _locked(self, exclusive: bool, require: bool = True):
         """Hold the cross-process coordination lock for one serial operation."""
+        self._ensure_pid()
         with self._gate:
             # Fail before touching the coordination file: a missing root, a
             # root that is a file, or an absent pages.dat must not create
@@ -130,7 +235,9 @@ class PageStore:
                 if self._lock_fd is not None:
                     with contextlib.suppress(OSError):
                         os.close(self._lock_fd)
-                self._lock_fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                self._lock_fd = os.open(
+                    self._lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+                    0o600)
             fcntl.flock(
                 self._lock_fd,
                 fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
