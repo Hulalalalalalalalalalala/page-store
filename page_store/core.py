@@ -335,7 +335,9 @@ class PageStore:
         return len(payload).to_bytes(4, "big") + payload
 
     def _append_record(self, record: dict, count: int,
-                       expected: dict[str, str | None] | None = None
+                       expected: dict[str, str | None] | None = None,
+                       range_expectation: tuple[dict[str, str],
+                                                str | None, str | None] | None = None
                        ) -> list[int] | None:
         """Append one already-validated frame covering ``count`` records.
 
@@ -352,6 +354,14 @@ class PageStore:
         condition returns ``None`` instead: no number is consumed and the
         page file is left byte-for-byte untouched -- in particular a
         half-written tail is not truncated, since nothing was committed.
+
+        When ``range_expectation`` is given, it is ``(wanted, start, end)``
+        and the frame is appended only if the live subdirectory of the
+        half-open ``[start, end)`` key range equals ``wanted`` exactly --
+        same keys with same values, dict order irrelevant; an added key, a
+        deleted key or a changed value in the range fails the condition,
+        while changes outside the range are ignored.  A failed range
+        condition returns ``None`` with the same no-touch guarantees.
         """
         frame = self._encode(record)
         with self._locked(exclusive=True):
@@ -380,6 +390,20 @@ class PageStore:
                             return None
                     elif current != want:
                         return None
+            if range_expectation is not None:
+                # A full-range condition: the live subdirectory of the
+                # half-open range must match wanted exactly -- same keys with
+                # same values.  Checked here, after the mid-file corruption
+                # probe and in the same locked section as the append, so
+                # damage raises even when the comparison would fail and
+                # check-and-commit is one serial operation.  A half-written
+                # tail never reached _live, so it takes no part in it.
+                wanted, rstart, rend = range_expectation
+                current = {key: value for key, value in self._live.items()
+                           if (rstart is None or key >= rstart)
+                           and (rend is None or key < rend)}
+                if current != wanted:
+                    return None
             try:
                 with self.path.open("r+b") as handle:
                     # Cut at the confirmed boundary so a half-written tail
@@ -536,6 +560,77 @@ class PageStore:
         normalized = self._normalize_operations(operations)
         return self._append_record({"op": "batch", "ops": normalized},
                                    len(normalized), expected=dict(expected))
+
+    def write_batch_if_range(self, expected: dict[str, str],
+                             operations: list[dict],
+                             start: str | None = None,
+                             end: str | None = None) -> list[int] | None:
+        """Commit a batch only if a whole key range currently matches exactly.
+
+        ``expected`` maps non-empty string keys to the string values that
+        must be the *complete* set of live key/value pairs in the
+        half-open ``[start, end)`` range at the serial point -- ordering and
+        insertion order are irrelevant, every key in the range must appear in
+        ``expected`` with an equal value, and every condition key must lie in
+        the range.  An added key, a deleted key or a changed value anywhere
+        in the range fails the commit; changes outside the range never
+        affect it.  An empty ``expected`` dict requires the range to contain
+        no keys.  Boundaries follow ``scan``: each is a string (the empty
+        string is allowed) or ``None`` for an open boundary, and when
+        ``start >= end`` the range is empty.  A value that changed and was
+        later restored still matches: comparison is against the live state,
+        not the history.
+
+        ``operations`` follows the exact ``write_batch`` rules (a non-empty
+        list of put/delete dicts with the same per-operation payload limit);
+        a successful batch may also touch keys outside the range.  Every
+        argument -- the dict, its keys and values, both boundaries, the
+        in-range condition keys, and the whole operation list -- is
+        validated before the store is touched, so any ``ValueError`` is
+        raised ahead of every storage error and leaves the page file and
+        sequence numbers unchanged.
+
+        The comparison and the commit are one serial operation under the
+        coordination lock, sharing the serial order with every other write,
+        reset, recovery and compaction across instances, threads and
+        processes on this machine.  On mismatch the call returns ``None``:
+        no sequence number is consumed and the page file is left
+        byte-for-byte untouched, including any half-written tail a crashed
+        writer left behind.  On success the batch lands exactly like a
+        ``write_batch`` frame (the condition is not recorded and never
+        counts toward the record total) and the operations' consecutive
+        sequence numbers are returned, starting at one past the number of
+        confirmed records at that serial point.
+
+        Raises ``ValueError`` for any malformed argument (including a
+        condition key outside the range), ``FileNotFoundError`` when the
+        root is missing, points at a file, or ``pages.dat`` is absent (no
+        storage path is created), ``RuntimeError("corrupt_middle")`` when
+        damage precedes complete records -- even when the comparison would
+        fail -- and ``OSError`` on other read/write failures.
+        """
+        if not isinstance(expected, dict):
+            raise ValueError(
+                "expected must be a dict mapping in-range non-empty string "
+                "keys to their required current string values; an empty "
+                "dict requires the range to contain no keys")
+        if start is not None and not isinstance(start, str):
+            raise ValueError("start must be a string or None")
+        if end is not None and not isinstance(end, str):
+            raise ValueError("end must be a string or None")
+        for key, want in expected.items():
+            self._check_key(key)
+            if not isinstance(want, str):
+                raise ValueError("expected values must be strings")
+            if (start is not None and key < start) or \
+                    (end is not None and key >= end):
+                raise ValueError(
+                    f"condition key {key!r} lies outside the "
+                    f"[{start!r}, {end!r}) range")
+        normalized = self._normalize_operations(operations)
+        return self._append_record(
+            {"op": "batch", "ops": normalized}, len(normalized),
+            range_expectation=(dict(expected), start, end))
 
     # -------------------------------------------------------------- reading
 
