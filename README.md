@@ -59,6 +59,7 @@ python3 -m page_store --root ./state init
 
 ## 约定
 
+- 记录格式：四字节大端长度前缀 + UTF-8 JSON 载荷。有效记录的载荷长度为 1 至 4096 字节，内容是对象，`op` 为 `put` 或 `delete`，`key` 为非空字符串；`put` 还须携带字符串 `value`，`delete` 忽略 `value`，其他字段一律忽略。不满足这些条件的载荷、非法编码、非法 JSON 与半写数据都视为中断：连续回放在首个中断处停下，不计作完整记录，也不改变键值；仅当中断之后任意偏移仍存在符合上述规则的完整记录时判为 `corrupt_middle`（标量 JSON 或非法对象不构成证据），否则为 `incomplete_tail`。`get`、`scan`、`stats`、`snapshot` 只反映连续有效前缀，`records` 不含损坏记录，`pages` 仍按文件实际大小计算，读取不截断文件。
 - 所有写操作立即持久化；进程被杀死后 `recover`/`init` 之外的重开不得丢失已确认的写。
 - 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`。
 - 退出码：0 成功，1 存储或校验错误，2 用法错误；`verify` 另用 3 表示页文件无法读取、4 表示中段损坏。

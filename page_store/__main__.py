@@ -78,14 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "scan":
             print(json.dumps(store.scan(args.start, args.end), ensure_ascii=False))
         elif args.command == "recover":
-            try:
-                print(json.dumps(store.recover(), sort_keys=True))
-            except RuntimeError as error:
-                if str(error) != "corrupt_middle":
-                    raise
-                offset = store.verify()["first_error_offset"]
-                print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
-                return 1
+            print(json.dumps(store.recover(), sort_keys=True))
         elif args.command == "stats":
             print(json.dumps(store.stats(), sort_keys=True))
         elif args.command == "compact":
@@ -93,12 +86,6 @@ def main(argv: list[str] | None = None) -> int:
                 result = store.compact()
             except FileNotFoundError:
                 print(f"error: no store at {store.path}", file=sys.stderr)
-                return STORAGE_ERROR
-            except RuntimeError as error:
-                if str(error) != "corrupt_middle":
-                    raise
-                offset = store.verify()["first_error_offset"]
-                print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
                 return STORAGE_ERROR
             except OSError:
                 print("error: io_error", file=sys.stderr)
@@ -118,6 +105,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except FileNotFoundError as error:
         print(f"error: {error}", file=sys.stderr)
+        return 1
+    except RuntimeError as error:
+        # put/delete/recover/compact all refuse a mid-file-corrupt store the
+        # same way: one stderr line naming verify's first_error_offset, empty
+        # stdout, exit 1, and the file left byte-for-byte untouched.
+        if str(error) != "corrupt_middle":
+            raise
+        offset = store.verify()["first_error_offset"]
+        print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
         return 1
     except (KeyError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

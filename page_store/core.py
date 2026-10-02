@@ -153,18 +153,38 @@ class PageStore:
 
     @staticmethod
     def _record_at(data: bytes, offset: int) -> dict | None:
-        """Parse one record at ``offset``; ``None`` when it is not whole and valid."""
+        """Parse one record at ``offset``; ``None`` when it is not whole and valid.
+
+        A record is valid only when its length prefix is 1..4096, the payload
+        is whole, decodes as UTF-8 JSON, and the JSON is an object with
+        ``op`` of ``"put"`` or ``"delete"`` and a non-empty string ``key``;
+        a ``put`` must also carry a string ``value``.  Anything else -- bad
+        length, half-written bytes, invalid encoding, invalid JSON, a scalar
+        or array payload, or a malformed object -- is *not* a record: replay
+        stops there and the bytes never change the key state.
+        """
         size = len(data)
         if offset + 4 > size:
             return None
         rec_size = int.from_bytes(data[offset:offset + 4], "big")
+        if rec_size < 1 or rec_size > PAGE_SIZE:
+            return None
         if offset + 4 + rec_size > size:
             return None
         try:
-            json.loads(data[offset + 4:offset + 4 + rec_size].decode("utf-8"))
+            decoded = json.loads(data[offset + 4:offset + 4 + rec_size].decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             return None
-        return {"end": offset + 4 + rec_size}
+        if not isinstance(decoded, dict):
+            return None
+        if decoded.get("op") not in ("put", "delete"):
+            return None
+        key = decoded.get("key")
+        if not isinstance(key, str) or not key:
+            return None
+        if decoded["op"] == "put" and not isinstance(decoded.get("value"), str):
+            return None
+        return {"end": offset + 4 + rec_size, "decoded": decoded}
 
     def _scan_from(self, data: bytes, offset: int,
                    live: dict[str, str]) -> tuple[int, int]:
@@ -174,11 +194,11 @@ class PageStore:
         while offset < size:
             record = self._record_at(data, offset)
             if record is None:
-                break  # a half-written tail record is discarded
-            decoded = json.loads(data[offset + 4:record["end"]].decode("utf-8"))
+                break  # a half-written or invalid tail record is discarded
+            decoded = record["decoded"]
             if decoded["op"] == "put":
                 live[decoded["key"]] = decoded["value"]
-            else:
+            else:  # "delete"; any extra fields, including value, are ignored
                 live.pop(decoded["key"], None)
             offset = record["end"]
             count += 1
@@ -354,20 +374,8 @@ class PageStore:
             assert self._live is not None
             data = self.path.read_bytes()
             size = len(data)
-            offset, records_before = 0, 0
             live: dict[str, str] = {}
-            while offset < size:
-                record = self._record_at(data, offset)
-                if record is None:
-                    break  # a half-written tail record is discarded
-                chunk = data[offset + 4:record["end"]]
-                decoded = json.loads(chunk.decode("utf-8"))
-                if decoded["op"] == "put":
-                    live[decoded["key"]] = decoded["value"]
-                else:
-                    live.pop(decoded["key"], None)
-                offset = record["end"]
-                records_before += 1
+            offset, records_before = self._scan_from(data, 0, live)
             if offset < size and self._has_record_after(data, offset):
                 raise RuntimeError("corrupt_middle")  # leave the file untouched
             discarded = size - offset
@@ -429,13 +437,8 @@ class PageStore:
             self._require_store()
             data = self.path.read_bytes()
             size = len(data)
-            offset, records = 0, 0
-            while offset < size:
-                record = self._record_at(data, offset)
-                if record is None:
-                    break  # partial prefix, declared length past EOF, or bad payload
-                offset = record["end"]
-                records += 1
+            live: dict[str, str] = {}
+            offset, records = self._scan_from(data, 0, live)
             truncated = offset < size
             if truncated:
                 if self._has_record_after(data, offset):
@@ -444,8 +447,6 @@ class PageStore:
                     handle.truncate(offset)
                     handle.flush()
                     os.fsync(handle.fileno())
-            live: dict[str, str] = {}
-            self._scan_from(data[:offset], 0, live)
             self._live = live
             self._seq = records
             self._end = offset
