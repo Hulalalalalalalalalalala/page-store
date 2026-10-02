@@ -892,6 +892,178 @@ class PageStore:
             return {"pages": (offset + PAGE_SIZE - 1) // PAGE_SIZE,
                     "records": records, "truncated": truncated}
 
+    # ------------------------------------------------------ backup / restore
+
+    #: The only backup format version this implementation reads and writes.
+    BACKUP_VERSION = 1
+
+    def backup(self) -> bytes:
+        """Capture the live key state as a portable UTF-8 JSON byte string.
+
+        The image is a JSON object with exactly the fields ``version`` (the
+        integer ``1``) and ``items`` (an array of ``[key, value]`` arrays in
+        ``scan`` order); an empty store yields an empty ``items`` array.
+        Only live keys are captured, keys and values are carried as exact
+        strings, and the encoding is canonical, so the same state always
+        produces the same bytes.
+
+        The capture is one serial point under the coordination lock, shared
+        with every other operation across instances, threads and processes:
+        only a complete before/after state of any concurrent write, reset,
+        recovery, compaction or restore is ever captured.  A half-written
+        tail is ignored -- the page file is neither truncated nor otherwise
+        modified and no sequence number is advanced.  When a complete record
+        can still be found past a damaged region (the ``verify``
+        ``corrupt_middle`` judgement), ``RuntimeError("corrupt_middle")`` is
+        raised instead.  Raises ``FileNotFoundError`` when the root is
+        missing, points at a file, or ``pages.dat`` is absent (no path is
+        created), and ``OSError`` on other read failures.
+        """
+        with self._locked(exclusive=False):
+            self._resync()
+            assert self._live is not None and self._identity is not None
+            if self._identity[2] - self._end > 0:
+                data = self.path.read_bytes()
+                if self._record_past(data, self._end):
+                    raise RuntimeError("corrupt_middle")
+            items = [[key, self._live[key]] for key in sorted(self._live)]
+            # Canonical encoding: fixed field order, compact separators and
+            # ASCII escaping, so equal states serialise to equal bytes and
+            # every string (including lone surrogates) round-trips exactly.
+            return json.dumps({"version": self.BACKUP_VERSION, "items": items},
+                              separators=(",", ":")).encode("utf-8")
+
+    @staticmethod
+    def _unique_object(pairs: list) -> dict:
+        """``object_pairs_hook`` that rejects duplicate object fields."""
+        obj: dict = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f"duplicate object field {key!r}")
+            obj[key] = value
+        return obj
+
+    @classmethod
+    def _parse_backup(cls, data: bytes) -> list[tuple[str, str]]:
+        """Validate a backup image wholesale; return its (key, value) pairs.
+
+        Every check runs before the target store is touched, so a
+        ``ValueError`` raised here leaves the page file, the sequence
+        numbers and the filesystem exactly as they were.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("backup data must be a bytes object")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("backup data is not valid UTF-8") from None
+        try:
+            parsed = json.loads(text, object_pairs_hook=cls._unique_object)
+        except ValueError as error:
+            raise ValueError(f"backup data is not valid JSON ({error})") from None
+        if not isinstance(parsed, dict) or set(parsed) != {"version", "items"}:
+            raise ValueError(
+                "backup must be an object with exactly the fields "
+                "'version' and 'items'")
+        version = parsed["version"]
+        if type(version) is not int or version != cls.BACKUP_VERSION:
+            # bool is not accepted even though True == 1.
+            raise ValueError("backup version must be the integer 1")
+        items = parsed["items"]
+        if not isinstance(items, list):
+            raise ValueError("backup items must be an array")
+        seen: set[str] = set()
+        pairs: list[tuple[str, str]] = []
+        for entry in items:
+            if not isinstance(entry, list) or len(entry) != 2:
+                raise ValueError(
+                    "each backup item must be a [key, value] array")
+            key, value = entry
+            if not isinstance(key, str) or not key:
+                raise ValueError("backup keys must be non-empty strings")
+            if not isinstance(value, str):
+                raise ValueError("backup values must be strings")
+            if key in seen:
+                raise ValueError(f"duplicate backup key {key!r}")
+            seen.add(key)
+            payload = len(cls._encode(
+                {"op": "put", "key": key, "value": value})) - 4
+            if payload > PAGE_SIZE:
+                raise ValueError(
+                    f"entry for key {key!r} exceeds the one-record size "
+                    f"limit ({payload} > {PAGE_SIZE})")
+            pairs.append((key, value))
+        return pairs
+
+    def restore(self, data: bytes) -> dict:
+        """Replace the entire store with the contents of a backup image.
+
+        ``data`` must be ``bytes`` holding a UTF-8 JSON object with exactly
+        the fields ``version`` (the integer ``1``; ``true`` is not accepted)
+        and ``items`` (an array of ``[key, value]`` arrays in any order,
+        each two strings, keys non-empty and unique, every entry within the
+        single-put 4096-byte payload limit).  Non-``bytes`` input, invalid
+        UTF-8 or JSON, duplicate object fields, missing or extra top-level
+        fields, a wrong version, malformed entries, duplicate keys and
+        oversized entries all raise ``ValueError``; every check runs before
+        the target is accessed, so a failed call creates no file, leaves the
+        page file byte-for-byte untouched and consumes no sequence number.
+
+        A valid image *replaces* the store as one serial point under the
+        coordination lock -- shared with every other operation across
+        instances, threads and processes on this machine -- so readers only
+        ever see the complete old state or the complete new one.  Old keys
+        are not merged in: the new content is exactly the image's entries
+        (an empty ``items`` array empties the store), written over any
+        half-written tail or mid-file corruption.  The new file is built
+        beside the old one, fsynced and atomically swapped in, so a success
+        is durable when it returns and an interruption leaves either the
+        complete old file or the complete restored one -- never a mixture.
+        Long-lived and fork-inherited instances see the new state on their
+        next operation with no ``recover`` needed; existing ``Snapshot``
+        views are unaffected.  Later appends number from the entry count
+        plus one.
+
+        Returns a ``stats``-shaped dict: ``records`` and ``keys`` equal the
+        entry count and ``pages`` is computed from the new file size.
+        Raises ``FileNotFoundError`` when the root is missing, points at a
+        file, or ``pages.dat`` is absent (no path is created), and
+        ``OSError`` on other read/write failures (leaving no mixed state).
+        """
+        pairs = self._parse_backup(data)
+        frames = [self._encode({"op": "put", "key": key, "value": value})
+                  for key, value in sorted(pairs)]
+        image = b"".join(frames)
+        with self._locked(exclusive=True):
+            # Install a fresh inode like init/compact do: the atomic swap is
+            # the serial point, and other instances detect the new inode and
+            # rebuild from the restored image on their next operation.
+            tmp = self.directory / f".{LOG_FILE}.restore.tmp"
+            try:
+                with tmp.open("wb") as handle:
+                    handle.write(image)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, self.path)
+                dirfd = os.open(self.directory, os.O_RDONLY)
+                try:
+                    os.fsync(dirfd)
+                finally:
+                    os.close(dirfd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+                # The old file may or may not still be the one the cache was
+                # built from; force a full rescan on the next operation.
+                self._invalidate()
+                raise
+            self._live = dict(pairs)
+            self._seq = len(pairs)
+            self._end = len(image)
+            self._identity = self._identity_of()
+            return {"pages": (len(image) + PAGE_SIZE - 1) // PAGE_SIZE,
+                    "records": len(pairs), "keys": len(pairs)}
+
     # --------------------------------------------------------------- verify
 
     def verify(self) -> dict:

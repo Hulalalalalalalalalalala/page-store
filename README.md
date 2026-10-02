@@ -61,6 +61,8 @@ python3 -m page_store --root ./state init
 - `compact() -> dict` 将存活键值原子重写为按键升序的最少 `put` 记录，返回 `{pages_before, pages_after, records_before, records_after, keys, discarded_tail_bytes}`；root 不存在、指向文件或缺少 `pages.dat` 时抛出 `FileNotFoundError`，中段损坏抛出 `RuntimeError("corrupt_middle")` 且文件不变，读写失败抛出 `OSError`。
 - `stats() -> dict` 返回页数、记录数与存活键数。
 - `verify() -> dict` 只读校验页文件，返回上述固定字段的 JSON 口径字典。
+- `backup() -> bytes` 把当前存活键值导出为 UTF-8 JSON 字节串：顶层对象恰含整数 `version`（值为 1）与 `items`（按 `scan` 顺序排列的 `[key, value]` 数组，空存储为空数组），只保存存活键值，字符串原样保留，编码规范化使相同状态产生相同字节。捕获在协调锁内完成，只见完整串行点；半写尾被忽略（不截断页文件、不推进序号），中段损坏按 `verify` 口径抛 `RuntimeError("corrupt_middle")`；root 不存在、指向文件或缺少 `pages.dat` 时抛 `FileNotFoundError`（不建路径），其他读取失败抛 `OSError`。
+- `restore(data) -> dict` 用备份映像**整体替换**目标存储。`data` 必须是 `bytes`：UTF-8 JSON 对象，恰含 `version`（只接受整数 1，布尔值不接受）与 `items`（`[key, value]` 数组，可乱序，每项恰为两个字符串，键非空且不重复，每条 put 负载沿用 4096 字节上限）。非 bytes、非法 UTF-8 或 JSON、重复对象字段、顶层字段缺失或多余、版本错误、非法条目或超限均抛 `ValueError`，且全部校验先于目标访问——失败不创建文件、不改页文件、不占序号。有效映像作为一个串行点整体生效：不合并旧键，可覆盖半写尾与中段损坏，空 `items` 清空存储；新文件经临时文件 fsync 后原子换入，成功返回即持久化，中断后只留下完整旧文件或完整恢复文件；长期存活及 fork 继承实例下一次操作即见新状态，无须 `recover`，旧 `Snapshot` 不变。返回与 `stats` 同口径的 `{pages, records, keys}`，`records` 与 `keys` 等于条目数，`pages` 按新文件大小计算，后续追加从条目数加一编号。root 不存在、指向文件或缺少 `pages.dat` 时抛 `FileNotFoundError`（不建路径），其他读写失败抛 `OSError`，不留混合状态。
 
 ## 约定
 
