@@ -152,35 +152,78 @@ class PageStore:
         self._identity = None
 
     @staticmethod
-    def _record_at(data: bytes, offset: int) -> dict | None:
-        """Parse one record at ``offset``; ``None`` when it is not whole and valid."""
+    def _record_at(data: bytes, offset: int) -> tuple[int, dict] | None:
+        """Parse one record at ``offset``.
+
+        A record is a four-byte big-endian length prefix followed by 1..4096
+        UTF-8 bytes encoding a JSON object whose ``op`` is ``"put"`` or
+        ``"delete"`` and whose ``key`` is a non-empty string; a ``put`` record
+        additionally carries a string ``value``.  A ``delete`` ignores its
+        ``value`` and both ops ignore every other field.  Anything else -- a
+        partial prefix, a declared length past EOF or outside 1..4096, a bad
+        UTF-8 or JSON payload, a scalar/array payload, an unknown op, or a
+        missing/invalid ``key``/``value`` -- is a break in the stream rather
+        than a record, so callers treat it exactly like a half-written tail and
+        never let a ``KeyError``/``TypeError`` escape.  Returns the boundary
+        just past the record and its decoded object, or ``None``.
+        """
         size = len(data)
         if offset + 4 > size:
             return None
         rec_size = int.from_bytes(data[offset:offset + 4], "big")
-        if offset + 4 + rec_size > size:
+        if not 1 <= rec_size <= PAGE_SIZE or offset + 4 + rec_size > size:
             return None
         try:
-            json.loads(data[offset + 4:offset + 4 + rec_size].decode("utf-8"))
+            decoded = json.loads(
+                data[offset + 4:offset + 4 + rec_size].decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             return None
-        return {"end": offset + 4 + rec_size}
+        if not isinstance(decoded, dict):
+            return None
+        op = decoded.get("op")
+        if op not in ("put", "delete"):
+            return None
+        key = decoded.get("key")
+        if not isinstance(key, str) or not key:
+            return None
+        if op == "put" and not isinstance(decoded.get("value"), str):
+            return None
+        return offset + 4 + rec_size, decoded
+
+    @classmethod
+    def _record_past(cls, data: bytes, offset: int) -> bool:
+        """Whether a valid record starts at any later offset past ``offset``.
+
+        Only a frame that satisfies the full record rule can be evidence of
+        mid-file corruption; a scalar JSON value or an invalid object buried in
+        the damaged region proves nothing.  The first offsets tried immediately
+        after the break also cover the case where the frame's own declared
+        length runs past EOF (its whole payload region is searched).
+        """
+        size = len(data)
+        return any(cls._record_at(data, start) is not None
+                   for start in range(offset + 1, size - 3))
 
     def _scan_from(self, data: bytes, offset: int,
                    live: dict[str, str]) -> tuple[int, int]:
-        """Replay whole records from ``offset`` into ``live``; return (end, count)."""
+        """Replay whole records from ``offset`` into ``live``; return (end, count).
+
+        Stops at the first boundary that is not a whole, valid record; the
+        caller decides whether the remaining bytes are a half-written tail or
+        mid-file corruption.
+        """
         size = len(data)
         count = 0
         while offset < size:
-            record = self._record_at(data, offset)
-            if record is None:
-                break  # a half-written tail record is discarded
-            decoded = json.loads(data[offset + 4:record["end"]].decode("utf-8"))
+            parsed = self._record_at(data, offset)
+            if parsed is None:
+                break
+            end, decoded = parsed
             if decoded["op"] == "put":
                 live[decoded["key"]] = decoded["value"]
             else:
                 live.pop(decoded["key"], None)
-            offset = record["end"]
+            offset = end
             count += 1
         return offset, count
 
@@ -235,19 +278,21 @@ class PageStore:
             # synced; bring the serial point up to date first.
             self._resync()
             assert self._live is not None and self._identity is not None
-            if self._identity[2] - self._end > 0:
-                trailing = self.path.read_bytes()[self._end:]
-                if self._record_past(trailing):
-                    # A complete record exists beyond the unparseable region:
-                    # the file is corrupt in the middle.  Never overwrite or
-                    # skip those records; leave the file byte-for-byte untouched.
+            size = self._identity[2]
+            if size - self._end > 0:
+                data = self.path.read_bytes()
+                if self._record_past(data, self._end):
+                    # A complete, valid record exists beyond the unparseable
+                    # region: the file is corrupt in the middle.  Never
+                    # overwrite or skip those records; leave the file
+                    # byte-for-byte untouched.
                     raise RuntimeError("corrupt_middle")
             try:
                 with self.path.open("r+b") as handle:
                     # Cut at the confirmed boundary so a half-written tail
                     # left by a crashed (unconfirmed) writer is overwritten
                     # rather than sealed in front of the new record.
-                    if self._identity[2] - self._end > 0:
+                    if size - self._end > 0:
                         handle.truncate(self._end)
                     handle.seek(self._end)
                     handle.write(frame)
@@ -265,11 +310,10 @@ class PageStore:
                 self._invalidate()
                 raise
             # Confirmed: the append is now part of the serial point.
-            decoded = json.loads(frame[4:].decode("utf-8"))
-            if decoded["op"] == "put":
-                self._live[decoded["key"]] = decoded["value"]
+            if record["op"] == "put":
+                self._live[record["key"]] = record["value"]
             else:
-                self._live.pop(decoded["key"], None)
+                self._live.pop(record["key"], None)
             self._seq += 1
             self._end += len(frame)
             try:
@@ -357,18 +401,17 @@ class PageStore:
             offset, records_before = 0, 0
             live: dict[str, str] = {}
             while offset < size:
-                record = self._record_at(data, offset)
-                if record is None:
-                    break  # a half-written tail record is discarded
-                chunk = data[offset + 4:record["end"]]
-                decoded = json.loads(chunk.decode("utf-8"))
+                parsed = self._record_at(data, offset)
+                if parsed is None:
+                    break  # the continuous valid prefix ends here
+                end, decoded = parsed
                 if decoded["op"] == "put":
                     live[decoded["key"]] = decoded["value"]
                 else:
                     live.pop(decoded["key"], None)
-                offset = record["end"]
+                offset = end
                 records_before += 1
-            if offset < size and self._has_record_after(data, offset):
+            if offset < size and self._record_past(data, offset):
                 raise RuntimeError("corrupt_middle")  # leave the file untouched
             discarded = size - offset
             frames = [self._encode({"op": "put", "key": key, "value": live[key]})
@@ -430,38 +473,33 @@ class PageStore:
             data = self.path.read_bytes()
             size = len(data)
             offset, records = 0, 0
+            live: dict[str, str] = {}
             while offset < size:
-                record = self._record_at(data, offset)
-                if record is None:
-                    break  # partial prefix, declared length past EOF, or bad payload
-                offset = record["end"]
+                parsed = self._record_at(data, offset)
+                if parsed is None:
+                    break  # partial prefix, declared length past EOF/out of
+                           # range, bad encoding/JSON, or an invalid payload
+                end, decoded = parsed
+                if decoded["op"] == "put":
+                    live[decoded["key"]] = decoded["value"]
+                else:
+                    live.pop(decoded["key"], None)
+                offset = end
                 records += 1
             truncated = offset < size
             if truncated:
-                if self._has_record_after(data, offset):
+                if self._record_past(data, offset):
                     raise RuntimeError("corrupt_middle")
                 with self.path.open("r+b") as handle:
                     handle.truncate(offset)
                     handle.flush()
                     os.fsync(handle.fileno())
-            live: dict[str, str] = {}
-            self._scan_from(data[:offset], 0, live)
             self._live = live
             self._seq = records
             self._end = offset
             self._identity = self._identity_of()
             return {"pages": (offset + PAGE_SIZE - 1) // PAGE_SIZE,
                     "records": records, "truncated": truncated}
-
-    def _has_record_after(self, data: bytes, offset: int) -> bool:
-        """Whether any valid record can be re-synchronised past ``offset``."""
-        return any(self._record_at(data, start) is not None
-                   for start in range(offset + 1, len(data) - 3))
-
-    def _record_past(self, region: bytes) -> bool:
-        """Whether a complete record hides anywhere in a post-boundary region."""
-        return any(self._record_at(region, start) is not None
-                   for start in range(0, len(region) - 3))
 
     # --------------------------------------------------------------- verify
 
@@ -483,15 +521,15 @@ class PageStore:
         result["scanned_end_offset"] = size
         offset = 0
         while offset < size:
-            record = self._record_at(data, offset)
-            if record is None:
+            parsed = self._record_at(data, offset)
+            if parsed is None:
                 break
-            offset = record["end"]
+            offset = parsed[0]
             result["complete_records"] += 1
         result["valid_pages"] = offset // PAGE_SIZE
         if offset == size:
             return result
-        if self._has_record_after(data, offset):
+        if self._record_past(data, offset):
             result.update(status="corrupt_middle", error="corrupt_middle",
                           first_error_offset=offset)
         else:

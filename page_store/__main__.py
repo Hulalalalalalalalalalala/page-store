@@ -17,6 +17,18 @@ from .core import PageStore
 USAGE_ERROR = 2
 STORAGE_ERROR = 1
 
+
+def _corrupt_middle(store: PageStore) -> int:
+    """Print the one-line corrupt_middle diagnostic; return the exit code.
+
+    The offset is taken from a fresh read-only ``verify`` so it matches
+    ``first_error_offset`` exactly; nothing is written to standard output.
+    """
+    offset = store.verify()["first_error_offset"]
+    print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
+    return STORAGE_ERROR
+
+
 def _tags() -> list[str]:
     """Tags this domain claims: the comma-separated line that follows each named category heading."""
     import pathlib
@@ -70,22 +82,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init":
             store.init(); print(f"initialised {store.path}")
         elif args.command == "put":
-            print(store.put(args.key, args.value))
+            try:
+                print(store.put(args.key, args.value))
+            except RuntimeError as error:
+                if str(error) == "corrupt_middle":
+                    return _corrupt_middle(store)
+                raise
         elif args.command == "get":
             value = store.get(args.key); print("" if value is None else value)
         elif args.command == "delete":
-            print(store.delete(args.key))
+            try:
+                print(store.delete(args.key))
+            except RuntimeError as error:
+                if str(error) == "corrupt_middle":
+                    return _corrupt_middle(store)
+                raise
         elif args.command == "scan":
             print(json.dumps(store.scan(args.start, args.end), ensure_ascii=False))
         elif args.command == "recover":
             try:
                 print(json.dumps(store.recover(), sort_keys=True))
             except RuntimeError as error:
-                if str(error) != "corrupt_middle":
-                    raise
-                offset = store.verify()["first_error_offset"]
-                print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
-                return 1
+                if str(error) == "corrupt_middle":
+                    return _corrupt_middle(store)
+                raise
         elif args.command == "stats":
             print(json.dumps(store.stats(), sort_keys=True))
         elif args.command == "compact":
@@ -95,11 +115,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: no store at {store.path}", file=sys.stderr)
                 return STORAGE_ERROR
             except RuntimeError as error:
-                if str(error) != "corrupt_middle":
-                    raise
-                offset = store.verify()["first_error_offset"]
-                print(f"error: corrupt_middle at offset {offset}", file=sys.stderr)
-                return STORAGE_ERROR
+                if str(error) == "corrupt_middle":
+                    return _corrupt_middle(store)
+                raise
             except OSError:
                 print("error: io_error", file=sys.stderr)
                 return STORAGE_ERROR
