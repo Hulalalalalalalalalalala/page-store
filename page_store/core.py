@@ -364,8 +364,11 @@ class PageStore:
         Batch frames may span several pages, so the scan is O(n) cheap prefix
         checks: the full JSON decode runs only when the declared length fits
         and either stays within one page (a bare put/delete frame) or the
-        payload opens like a JSON object carrying an ``op`` member, which a
-        batch object must do within its first bytes.
+        payload's first non-whitespace byte opens a JSON object, which every
+        batch payload must do.  Everything past that first byte -- field
+        order, whitespace width, escaped field names -- is decided by the
+        same full decode the continuous reader applies, so a frame that
+        reader would accept is never skipped here.
         """
         size = len(data)
         for start in range(offset + 1, size - 3):
@@ -374,8 +377,13 @@ class PageStore:
             if rec_size < 1 or end > size:
                 continue
             if rec_size > PAGE_SIZE:
-                head = data[start + 4:start + 4 + 32]
-                if not head.lstrip().startswith(b"{") or b'"op"' not in head:
+                # Only a batch frame may exceed one page, and its payload is
+                # a JSON object; JSON whitespace is exactly space, tab, LF
+                # and CR, and may be arbitrarily wide.
+                pos = start + 4
+                while pos < end and data[pos] in b" \t\n\r":
+                    pos += 1
+                if pos >= end or data[pos] != 0x7B:  # '{'
                     continue
             if cls._record_at(data, start) is not None:
                 return True
