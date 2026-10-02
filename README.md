@@ -16,6 +16,8 @@ python3 -m page_store --root ./state init
 
 子命令：`init`、`put <key> <value>`、`get <key>`、`delete <key>`、`scan [--start S] [--end E]`、`recover`、`stats`、`compact`、`report`、`verify`。
 
+`write_batch` 只是公开 API（见下），不增加命令行子命令；批次落盘后对现有命令完全透明——`stats`/`recover`/`verify` 的记录计数按已保留操作条数计算，`compact` 仍把存活键值重写为最少的升序普通 `put` 记录（批次标记不落进压缩结果），压缩后的序号从压缩后记录数继续。
+
 `compact` 把存活键值重写为按键升序、数量最少的 `put` 记录（旧值与删除记录不落盘，半写尾记录一并丢弃），经临时文件原子替换 `pages.dat`：压缩中断后只留下完整旧文件或完整新文件，不会混合。相同存活状态生成相同的记录顺序与文件内容，压缩后首次 `put`/`delete` 的序号从新的完整记录数继续递增。成功时标准输出只写一行 JSON，字段固定且顺序为：
 
 - `pages_before` / `pages_after`：压缩前后占用页数（文件大小按 4096 向上取整）。
@@ -28,7 +30,7 @@ python3 -m page_store --root ./state init
 `verify` 只读校验页文件，不改动数据，也不影响后续 `recover`、`stats`、`report`。它在标准输出只输出一行 JSON，字段固定为：
 
 - `status`：`ok`（全部记录完整）、`incomplete_tail`（仅尾部半写）、`corrupt_middle`（中断区后仍有记录）、`error`（路径或读取失败）。
-- `complete_records`：连续解析得到的完整记录数；`incomplete_tail`/`corrupt_middle` 时只含中断点之前的部分。
+- `complete_records`：连续解析得到的完整记录数；`incomplete_tail`/`corrupt_middle` 时只含中断点之前的部分。批次完整提交时按成员条数计数、批次标记不计数；标记缺少成员时整批位于中断点之后，成员不计入。
 - `valid_pages`：完整记录末偏移整除 4096 的页数。
 - `first_error_offset`：`corrupt_middle` 时连续解析的中断点偏移，否则为 `null`。
 - `tail_partial_bytes`：`incomplete_tail` 时尾部残缺字节数，否则为 0。
@@ -43,16 +45,19 @@ python3 -m page_store --root ./state init
 
 - `init() -> None` 建立空存储（建目录是唯一允许自动创建路径的操作）。每次成功 `init` 都是一次串行状态变更：经临时文件原子替换出全新的空 `pages.dat`，重置前的写入被清空、重置后确认的写入保留；同一目录下其他长期存活的实例或进程下一次读取、`stats`、`snapshot` 或追加写入即看到新状态，无须关闭重开或先 `recover`（即使新文件长度与重置前相同或更长）。重置后、首次写入前 `stats` 三项均为 0，首次 `put`/`delete` 返回 1，此后序号从当前完整记录数继续递增。
 - `put(key, value) -> int` 追加一条记录并返回记录序号。`key` 必须是非空字符串、`value` 必须是字符串，否则抛 `ValueError`。
+- `write_batch(operations) -> list[int]` 把一个**非空**操作列表作为一个原子批次追加，返回与各项一一对应的连续序号列表（从当前完整记录数加一开始）。元素只允许是 `{"op": "put", "key": k, "value": v}` 或 `{"op": "delete", "key": k}`；非列表、空列表、非字典元素、未知操作、字段缺失或多余、`key` 非非空字符串、`value` 非字符串，或单条记录超出既有单页大小限制（4096 字节载荷），均抛 `ValueError`。整批校验先于任何存储操作：校验失败时页文件与序号均不变。成功后各项严格按输入顺序生效，重复键不合并，删除不存在的键同样占用一个序号；批次可跨多个页。
+  - 持久性与原子性：成功返回后整批已 fsync 持久化；写入失败或进程中断后重开，批次要么整体保留、要么整体不存在，未保留的批次不占序号。页文件上批次由一帧内部标记 `{"op": "batch", "n": k}` 后接 k 帧成员（内部 op `bput`/`bdelete`）构成；成员帧只在完整标记之下有效，标记是元数据，不计入任何记录计数，旧存储（仅含普通 put/delete 帧）无需迁移即可读写。
+  - 串行与可见性：批次与单条写入、`init` 重置、`compact`、`recover` 同属一个串行点；其他实例/进程的读取、统计、快照只能看到整批前或整批后的完整状态，既有快照不变。长期存活的实例在批次返回后的下一次读或写直接看到新状态，无须先 `recover`。批次不会隐式压缩历史。
 - `get(key) -> bytes | None` 读取最后一次写入的值。
 - `delete(key) -> int` 追加一条删除记录；`key` 必须是非空字符串，否则抛 `ValueError`。
 - `scan(start=None, end=None) -> list[tuple[bytes, bytes]]` 按键升序返回区间内的存活记录（半开区间）。
 
-多个实例/进程共享同一目录时，`put`、`delete`、`compact`、`recover` 在协调文件上互斥串行：并发结果等价于某次串行交织；每次成功的 `put`/`delete` 返回从当前记录数严格递增、不重复的记录序号，失败或未确认（进程崩溃）的调用不占号、不可见，其半写尾由下一次写入在确认边界截断，或由 `recover`/`compact` 丢弃；`pages.dat` 的完整记录不会被覆盖、撕裂或跳过。`get`、`scan`、`stats`、`snapshot` 持共享锁，只可能看到某一次串行操作变更前或变更后的完整状态。
+多个实例/进程共享同一目录时，`put`、`delete`、`write_batch`、`compact`、`recover` 在协调文件上互斥串行：并发结果等价于某次串行交织；每次成功的 `put`/`delete` 返回从当前记录数严格递增、不重复的记录序号，成功的批次按成员条数占用一段连续序号（整批全有或全无，失败或未确认（进程崩溃）的批次不占号、不可见），其半写尾（含未写完的批次标记与成员）由下一次写入在确认边界截断，或由 `recover`/`compact` 整段丢弃；`pages.dat` 的完整记录不会被覆盖、撕裂或跳过。`get`、`scan`、`stats`、`snapshot` 持共享锁，只可能看到某一次串行操作（含整个批次）变更前或变更后的完整状态。
 - `snapshot() -> Snapshot` 捕获调用时刻的存活键值状态，得到只读快照，捕获在协调锁内完成；root 不存在、指向文件或缺少 `pages.dat` 时与其他读操作一样抛出 `FileNotFoundError`。快照捕获后不随后续 put、delete、recover、compact（无论来自本实例还是其他进程）改变。
   - `get(key)` 返回该键在快照时刻最后一次 put 的值，已删除或从未写入返回 `None`。
   - `scan(start=None, end=None)` 按键升序返回 `list[tuple[str, str]]`，`start` 含、`end` 不含，省略边界为开放区间，`start >= end` 返回空列表。
   - `stats()` 返回 `{pages, records, keys}`，口径同存储的 `stats()`，且不随后续 put、delete、recover 变化。
-- `recover() -> dict` 重开页文件，返回 `{pages, records, truncated}`。
+- `recover() -> dict` 重开页文件，返回 `{pages, records, truncated}`。未完整落盘的批次（标记缺少任意成员，含标记写到一半）与半写尾记录一样被整段丢弃，截断点为该批次标记起始；批次标记自身不占记录数。
 - `compact() -> dict` 将存活键值原子重写为按键升序的最少 `put` 记录，返回 `{pages_before, pages_after, records_before, records_after, keys, discarded_tail_bytes}`；root 不存在、指向文件或缺少 `pages.dat` 时抛出 `FileNotFoundError`，中段损坏抛出 `RuntimeError("corrupt_middle")` 且文件不变，读写失败抛出 `OSError`。
 - `stats() -> dict` 返回页数、记录数与存活键数。
 - `verify() -> dict` 只读校验页文件，返回上述固定字段的 JSON 口径字典。
