@@ -18,6 +18,7 @@ import json
 import os
 import threading
 from pathlib import Path
+from typing import overload
 
 __all__ = ["PageStore", "Snapshot"]
 
@@ -334,7 +335,16 @@ class PageStore:
         payload = json.dumps(record, sort_keys=True).encode("utf-8")
         return len(payload).to_bytes(4, "big") + payload
 
-    def _append_record(self, record: dict, count: int) -> list[int]:
+    @overload
+    def _append_record(self, record: dict, count: int) -> list[int]: ...
+
+    @overload
+    def _append_record(self, record: dict, count: int,
+                       expected: dict[str, str | None]) -> list[int] | None: ...
+
+    def _append_record(self, record: dict, count: int,
+                       expected: dict[str, str | None] | None = None) \
+            -> list[int] | None:
         """Append one already-validated frame covering ``count`` records.
 
         Returns the consecutive sequence numbers assigned to those records,
@@ -342,6 +352,15 @@ class PageStore:
         put/delete passes ``count == 1``; a batch frame passes the length of
         its operation list, and the whole frame lands -- or is rolled back --
         as one serial point, so a crash keeps either all of it or none.
+
+        When ``expected`` is given, the current live values are compared
+        against it *after* resyncing and *before* the file is opened for
+        writing, still inside the same exclusive-locked serial operation:
+        a string value must match the live value verbatim and ``None``
+        requires the key to be absent (deleted counts as absent, and an
+        empty string is a value, not absence).  On any mismatch nothing is
+        written -- an existing half-written tail is not truncated either --
+        and ``None`` is returned.
         """
         frame = self._encode(record)
         with self._locked(exclusive=True):
@@ -356,8 +375,14 @@ class PageStore:
                     # A complete, valid record exists beyond the unparseable
                     # region: the file is corrupt in the middle.  Never
                     # overwrite or skip those records; leave the file
-                    # byte-for-byte untouched.
+                    # byte-for-byte untouched.  This precedes the condition
+                    # check, so corruption surfaces even when the condition
+                    # could not possibly hold.
                     raise RuntimeError("corrupt_middle")
+            if expected is not None and not self._conditions_hold(expected):
+                # Lost the conditional race (or the state never matched):
+                # no append, no truncation, no consumed sequence number.
+                return None
             try:
                 with self.path.open("r+b") as handle:
                     # Cut at the confirmed boundary so a half-written tail
@@ -391,6 +416,24 @@ class PageStore:
                 self._invalidate()
             return list(range(first, first + count))
 
+    def _conditions_hold(self, expected: dict[str, str | None]) -> bool:
+        """Whether the cached live state satisfies every ``expected`` entry.
+
+        A string entry must equal the live value verbatim; ``None`` requires
+        the key to be absent.  A deleted key and a never-written key are the
+        same (absent), while an empty string is a value and never satisfies
+        an absence requirement.  Called only while holding the exclusive
+        coordination lock with a freshly resynced serial point.
+        """
+        assert self._live is not None
+        for key, wanted in expected.items():
+            if wanted is None:
+                if key in self._live:
+                    return False
+            elif self._live.get(key) != wanted:
+                return False
+        return True
+
     @staticmethod
     def _check_key(key: object) -> None:
         if not isinstance(key, str) or not key:
@@ -410,6 +453,52 @@ class PageStore:
     def delete(self, key: str) -> int:
         self._check_key(key)
         return self._append_record({"op": "delete", "key": key}, 1)[0]
+
+    @staticmethod
+    def _validate_expected(expected: object) -> dict[str, str | None]:
+        """Validate the conditional map; return it unchanged on success.
+
+        It must be a dict whose keys are non-empty strings and whose values
+        are strings or ``None``.  Conditions never count as records and take
+        no part in the batch beyond the pre-commit check.
+        """
+        if not isinstance(expected, dict):
+            raise ValueError("expected must be a dict")
+        for key, value in expected.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError("expected keys must be non-empty strings")
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    "expected values must be strings or None")
+        return expected
+
+    @classmethod
+    def _validate_operations(cls, operations: object) -> list[dict]:
+        """Validate a non-empty put/delete list; return normalized records.
+
+        Mirrors :meth:`write_batch`: a non-empty list of exact put/delete
+        dictionaries, non-empty string keys, string values, and each single
+        operation's JSON payload within the one-record limit.  Raises
+        ``ValueError`` on the first problem without touching storage.
+        """
+        if not isinstance(operations, list) or not operations:
+            raise ValueError("operations must be a non-empty list")
+        normalized: list[dict] = []
+        for item in operations:
+            if not cls._valid_item(item):
+                raise ValueError(
+                    "each operation must be a dict with op 'put' "
+                    "(keys op, key, value) or 'delete' (keys op, key); "
+                    "key must be a non-empty string and value a string")
+            record = {"op": item["op"], "key": item["key"]}
+            if item["op"] == "put":
+                record["value"] = item["value"]
+            if len(cls._encode(record)) - 4 > PAGE_SIZE:
+                raise ValueError(
+                    "an operation in the batch exceeds the one-record "
+                    f"size limit ({PAGE_SIZE} bytes)")
+            normalized.append(record)
+        return normalized
 
     def write_batch(self, operations: list[dict]) -> list[int]:
         """Atomically append a non-empty batch of put/delete operations.
@@ -437,25 +526,52 @@ class PageStore:
         file is left untouched), and ``OSError`` on other read/write
         failures.
         """
-        if not isinstance(operations, list) or not operations:
-            raise ValueError("operations must be a non-empty list")
-        normalized: list[dict] = []
-        for item in operations:
-            if not self._valid_item(item):
-                raise ValueError(
-                    "each operation must be a dict with op 'put' "
-                    "(keys op, key, value) or 'delete' (keys op, key); "
-                    "key must be a non-empty string and value a string")
-            record = {"op": item["op"], "key": item["key"]}
-            if item["op"] == "put":
-                record["value"] = item["value"]
-            if len(self._encode(record)) - 4 > PAGE_SIZE:
-                raise ValueError(
-                    "an operation in the batch exceeds the one-record "
-                    f"size limit ({PAGE_SIZE} bytes)")
-            normalized.append(record)
+        normalized = self._validate_operations(operations)
         return self._append_record({"op": "batch", "ops": normalized},
                                    len(normalized))
+
+    def write_batch_if(self, expected: dict[str, str | None],
+                       operations: list[dict]) -> list[int] | None:
+        """Commit a batch only when the current live state matches ``expected``.
+
+        ``expected`` maps non-empty string keys to a string or ``None``:
+        a string requires the key's current live value to equal it verbatim;
+        ``None`` requires the key to be absent (a deleted key is absent, and
+        an empty string is a value rather than absence).  Condition keys
+        need not appear in ``operations``, and an empty dict commits
+        unconditionally.
+
+        ``operations`` follows :meth:`write_batch` exactly -- a non-empty
+        list of exact put/delete dicts, non-empty string keys, string
+        values, each single-operation JSON payload within 4096 bytes -- and
+        the batch applies in input order as one serial point, duplicate
+        keys and deletes of missing keys still taking numbers.
+
+        The check and the commit are one exclusive-locked serial operation,
+        shared with every put, delete, batch, reset, recovery and
+        compaction on this root (across instances, threads and processes).
+        When every condition holds the batch commits and its consecutive
+        sequence numbers -- starting at one past the current number of
+        complete records -- are returned; when any condition fails the call
+        returns ``None``, consumes no sequence number, changes nothing (an
+        existing half-written tail is not truncated), and a concurrent call
+        that checked the same old value cannot also succeed.
+
+        Both arguments are fully validated before storage is touched, so
+        malformed input raises ``ValueError`` ahead of any storage error and
+        leaves the page file and sequence numbers unchanged.  A valid call
+        raises ``FileNotFoundError`` when the root is missing, points at a
+        file, or ``pages.dat`` is absent (nothing is created);
+        ``RuntimeError("corrupt_middle")`` takes precedence over a failed
+        condition when damage precedes complete records (the file is left
+        byte-for-byte untouched); other read/write failures raise
+        ``OSError``.
+        """
+        conditions = self._validate_expected(expected)
+        normalized = self._validate_operations(operations)
+        return self._append_record(
+            {"op": "batch", "ops": normalized}, len(normalized),
+            expected=conditions)
 
     # -------------------------------------------------------------- reading
 
