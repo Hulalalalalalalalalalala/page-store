@@ -17,6 +17,7 @@ import fcntl
 import json
 import os
 import threading
+import weakref
 from pathlib import Path
 
 __all__ = ["PageStore", "Snapshot"]
@@ -24,6 +25,60 @@ __all__ = ["PageStore", "Snapshot"]
 PAGE_SIZE = 4096
 LOG_FILE = "pages.dat"
 LOCK_FILE = f".{LOG_FILE}.lock"
+
+# Every live PageStore registers here so the post-fork child hook can reset
+# each inherited instance.  A plain list of weak references is used (rather
+# than a WeakSet) because appending needs no Python-level lock: the fork hook
+# runs in a freshly single-threaded child, and any lock another thread may
+# have held at the fork instant would otherwise be unreleasable there.
+_instances: list[weakref.ref["PageStore"]] = []
+_fork_hooks_registered = False
+_fork_hooks_lock = threading.Lock()
+
+
+def _register_fork_hooks() -> None:
+    global _fork_hooks_registered
+    with _fork_hooks_lock:
+        if _fork_hooks_registered:
+            return
+        # fork() copies only the calling thread.  In a child this must run
+        # before any other Python thread starts (CPython guarantees it), so no
+        # inherited lock can be in use while the reset happens.
+        os.register_at_fork(after_in_child=_after_fork_child)
+        _fork_hooks_registered = True
+
+
+def _after_fork_child() -> None:
+    """Reset every inherited store for independent life in the child process.
+
+    Three pieces of per-process state would otherwise be wrong after a fork:
+
+    * the in-process gate lock may appear owned by a thread that never existed
+      in the child (one that held it when the fork happened), which would make
+      every later call wait on that thread forever;
+    * the coordination lock file descriptor shares one open file description
+      with the parent, so flock on it serialises against the parent's *same*
+      description rather than against the parent process -- the child could
+      glide straight through an operation the parent has in flight and then
+      race it;
+    * the cached serial point was built from the parent's view and must be
+      rebuilt under the child's own lock.
+
+    Closing the inherited fd also releases any flock the copied thread held,
+    but only for this child's copy of the description; the parent keeps its
+    own and holds the real lock.  If the parent is mid-operation the child
+    simply blocks at its freshly opened descriptor until the parent finishes
+    (or dies, at which point the kernel drops the parent's locks).
+    """
+    global _fork_hooks_lock
+    # The child is single-threaded here; a copy of this lock that happens to
+    # be held (a store was being constructed in another thread at fork time)
+    # would otherwise be unreleasable.
+    _fork_hooks_lock = threading.Lock()
+    for reference in list(_instances):
+        store = reference()
+        if store is not None:
+            store._reset_after_fork()
 
 
 class Snapshot:
@@ -56,6 +111,15 @@ class PageStore:
     Multiple instances pointing at the same directory, including instances in
     different processes, coordinate through a lock file so that their
     interleaved calls have the same result as a serial ordering.
+
+    An instance may also be inherited across ``os.fork`` (including the fork
+    start method of :mod:`multiprocessing`, repeated forks, and several
+    instances created before the fork): a fork hook gives the child its own
+    gate lock, closes the copied coordination-lock descriptor (lazily reopened
+    on the next call so it never shares the parent's open file description),
+    and drops the cached serial point.  The child therefore neither waits on a
+    thread that fork did not copy nor overtakes an operation the parent still
+    has in flight, and it keeps its place in the same serial ordering.
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -74,6 +138,45 @@ class PageStore:
         self._seq = 0
         self._end = 0
         self._identity: tuple[int, int, int, int, int] | None = None
+        # Make inherited instances fork-safe: after fork the child gets a new
+        # gate, a fresh coordination-lock descriptor and an empty cache, so it
+        # never waits on a thread that only existed in the parent and shares
+        # the single serial ordering through its own lock.
+        _register_fork_hooks()
+        _instances.append(weakref.ref(self))
+        # Keep the registry from growing without bound for short-lived
+        # stores by occasionally dropping references already dead.
+        if len(_instances) > 128:
+            _instances[:] = [ref for ref in _instances if ref() is not None]
+
+    def _reset_after_fork(self) -> None:
+        """Detach this copied instance from the parent's process state.
+
+        Runs in the child immediately after fork (before any new Python
+        thread can start), for every instance created before the fork --
+        including instances the forking thread never touched.
+        """
+        # A brand-new lock: whatever count/owner the copied RLock carried was
+        # the forking thread's (or, when another thread held it, a thread the
+        # child will never have), so the inherited object could never be
+        # released.  No other child thread exists yet, so replacing it is
+        # safe even if the forking thread was mid-call.
+        self._gate = threading.RLock()
+        # Drop the copied descriptor: it shares the parent's open file
+        # description, on which flock would neither queue behind the parent's
+        # held lock nor keep the parent out of the child's section.  Closing
+        # releases only this child's duplicate.  It is lazily reopened on the
+        # next call, which also preserves the rule that merely constructing a
+        # store (or forking with an unused inherited one) never creates the
+        # root directory or the lock file.
+        if self._lock_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._lock_fd)
+            self._lock_fd = None
+        # The serial point is rebuilt under the child's own coordination lock
+        # by the next call, so no pre-fork cache can mask what the parent or
+        # another child committed meanwhile.
+        self._invalidate()
 
     # ------------------------------------------------------------------ init
 
