@@ -929,3 +929,167 @@ class PageStore:
         else:
             result.update(status="incomplete_tail", tail_partial_bytes=size - offset)
         return result
+
+    # ------------------------------------------------------- logical backup
+
+    def backup(self) -> bytes:
+        """Capture the live state as a logical backup: UTF-8 JSON bytes.
+
+        The image is one JSON object with exactly the fields ``version``
+        (the integer 1) and ``items`` -- an array of ``[key, value]``
+        arrays in ``scan`` order holding every live pair (an empty store
+        yields an empty array).  Strings are preserved verbatim and the
+        serialisation is deterministic, so two captures of the same live
+        state produce identical bytes.
+
+        The capture is a complete serial point taken under the
+        coordination lock: a half-written tail is ignored -- the page
+        file is never truncated and no sequence number is consumed --
+        while damage followed by complete records is judged exactly like
+        ``verify`` and raises ``RuntimeError("corrupt_middle")``.
+        Raises ``FileNotFoundError`` when the root is missing, points at
+        a file, or ``pages.dat`` is absent (no path is created), and
+        ``OSError`` on other read failures.
+        """
+        with self._locked(exclusive=False):
+            data = self.path.read_bytes()
+            live: dict[str, str] = {}
+            offset, _ = self._scan_from(data, 0, live)
+            if offset < len(data) and self._record_past(data, offset):
+                raise RuntimeError("corrupt_middle")
+            items = [[key, live[key]] for key in sorted(live)]
+            image = {"version": 1, "items": items}
+            return json.dumps(image, sort_keys=True,
+                              separators=(",", ":")).encode("utf-8")
+
+    @classmethod
+    def _parse_backup(cls, data: bytes) -> list[tuple[str, str]]:
+        """Validate a backup image wholesale; return its (key, value) pairs.
+
+        Every malformed input raises ``ValueError`` before the target
+        store is touched: non-bytes input, invalid UTF-8 or JSON,
+        duplicate object fields, missing or extra top-level fields, a
+        version other than the integer 1 (a boolean is not an integer
+        here), a non-array ``items``, or any entry that is not exactly a
+        pair of strings with a non-empty, non-duplicate key whose single
+        ``put`` payload fits the existing one-record size limit.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("backup image must be bytes")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("backup image is not valid UTF-8") from None
+
+        def object_without_duplicates(pairs: list[tuple[str, object]]) -> dict:
+            obj: dict[str, object] = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError(f"duplicate object field {key!r}")
+                obj[key] = value
+            return obj
+
+        try:
+            decoded = json.loads(
+                text, object_pairs_hook=object_without_duplicates)
+        except ValueError as error:
+            raise ValueError(f"invalid backup image: {error}") from None
+        if not isinstance(decoded, dict) or set(decoded) != {"version", "items"}:
+            raise ValueError(
+                "backup image must be an object with exactly the fields "
+                "'version' and 'items'")
+        version = decoded["version"]
+        if isinstance(version, bool) or not isinstance(version, int) \
+                or version != 1:
+            raise ValueError("backup version must be the integer 1")
+        items = decoded["items"]
+        if not isinstance(items, list):
+            raise ValueError("backup items must be an array")
+        seen: set[str] = set()
+        pairs: list[tuple[str, str]] = []
+        for entry in items:
+            if not isinstance(entry, list) or len(entry) != 2:
+                raise ValueError(
+                    "each backup item must be a [key, value] pair")
+            key, value = entry
+            if not isinstance(key, str) or not key:
+                raise ValueError("backup keys must be non-empty strings")
+            if not isinstance(value, str):
+                raise ValueError("backup values must be strings")
+            if key in seen:
+                raise ValueError(f"duplicate backup key {key!r}")
+            seen.add(key)
+            record = {"op": "put", "key": key, "value": value}
+            if len(cls._encode(record)) - 4 > PAGE_SIZE:
+                raise ValueError(
+                    "an entry exceeds the one-record size limit "
+                    f"({PAGE_SIZE} bytes)")
+            pairs.append((key, value))
+        return pairs
+
+    def restore(self, data: bytes) -> dict:
+        """Replace the entire store with the contents of a backup image.
+
+        ``data`` follows the exact format :meth:`backup` produces; every
+        check runs before the target store is accessed, so a
+        ``ValueError`` creates no file, leaves the page file
+        byte-for-byte unchanged and consumes no sequence number.
+
+        A valid image is written as ascending ``put`` records through a
+        temporary file atomically swapped over ``pages.dat`` -- the same
+        crash-safe pattern as ``compact`` -- so the restore is one
+        serial point shared with every other operation across instances,
+        threads and processes on this machine: readers only ever see the
+        complete old state or the complete new one.  A half-written tail
+        or mid-file corruption of the old file is simply replaced, old
+        keys are never merged in, and an empty ``items`` array clears
+        the store.  A successful return means the new state is durable;
+        an interrupted restore leaves either the original file or the
+        complete restored one, and long-lived or fork-inherited
+        instances observe the new state on their next operation without
+        ``recover`` (existing snapshots are unaffected).
+
+        Returns a dictionary with the ``stats`` semantics: ``records``
+        and ``keys`` equal the entry count and ``pages`` is computed
+        from the new file size; later appends number from the entry
+        count plus one.  Raises ``FileNotFoundError`` when the root is
+        missing, points at a file, or ``pages.dat`` is absent (no path
+        is created), and ``OSError`` on other read/write failures,
+        never leaving a mixed state behind.
+        """
+        pairs = self._parse_backup(data)
+        frames = [self._encode({"op": "put", "key": key, "value": value})
+                  for key, value in sorted(pairs)]
+        image = b"".join(frames)
+        with self._locked(exclusive=True):
+            # Install a fresh inode rather than truncating the old one, so
+            # other instances detect the replacement by identity and an
+            # interrupted restore keeps either complete file -- never a
+            # mixture.
+            tmp = self.directory / f".{LOG_FILE}.restore.tmp"
+            try:
+                with tmp.open("wb") as handle:
+                    handle.write(image)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, self.path)
+                dirfd = os.open(self.directory, os.O_RDONLY)
+                try:
+                    os.fsync(dirfd)
+                finally:
+                    os.close(dirfd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+                # The old file may or may not still be the one the cache
+                # was built from; force a full rescan on the next
+                # operation.
+                self._invalidate()
+                raise
+            # The atomic swap is the new serial point.
+            self._live = dict(pairs)
+            self._seq = len(pairs)
+            self._end = len(image)
+            self._identity = self._identity_of()
+            return {"pages": (len(image) + PAGE_SIZE - 1) // PAGE_SIZE,
+                    "records": len(pairs), "keys": len(pairs)}
