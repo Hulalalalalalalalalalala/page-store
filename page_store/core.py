@@ -334,7 +334,9 @@ class PageStore:
         payload = json.dumps(record, sort_keys=True).encode("utf-8")
         return len(payload).to_bytes(4, "big") + payload
 
-    def _append_record(self, record: dict, count: int) -> list[int]:
+    def _append_record(self, record: dict, count: int,
+                       expected: dict[str, str | None] | None = None
+                       ) -> list[int] | None:
         """Append one already-validated frame covering ``count`` records.
 
         Returns the consecutive sequence numbers assigned to those records,
@@ -342,6 +344,14 @@ class PageStore:
         put/delete passes ``count == 1``; a batch frame passes the length of
         its operation list, and the whole frame lands -- or is rolled back --
         as one serial point, so a crash keeps either all of it or none.
+
+        When ``expected`` is given, the frame is appended only if every
+        condition holds at the serial point: a string must equal the key's
+        current live value exactly, ``None`` requires the key to be absent
+        (a deleted key is absent; an empty-string value is not).  A failed
+        condition returns ``None`` instead: no number is consumed and the
+        page file is left byte-for-byte untouched -- in particular a
+        half-written tail is not truncated, since nothing was committed.
         """
         frame = self._encode(record)
         with self._locked(exclusive=True):
@@ -358,6 +368,18 @@ class PageStore:
                     # overwrite or skip those records; leave the file
                     # byte-for-byte untouched.
                     raise RuntimeError("corrupt_middle")
+            if expected:
+                # Conditions are checked against the serial point just
+                # established, inside the same locked section as the commit,
+                # so check-and-commit is one serial operation.  Live values
+                # are always strings, so ``None`` from ``get`` means absent.
+                for key, want in expected.items():
+                    current = self._live.get(key)
+                    if want is None:
+                        if current is not None:
+                            return None
+                    elif current != want:
+                        return None
             try:
                 with self.path.open("r+b") as handle:
                     # Cut at the confirmed boundary so a half-written tail
@@ -411,6 +433,32 @@ class PageStore:
         self._check_key(key)
         return self._append_record({"op": "delete", "key": key}, 1)[0]
 
+    @classmethod
+    def _normalize_operations(cls, operations: list[dict]) -> list[dict]:
+        """Validate a batch operation list wholesale and normalise it.
+
+        Raises ``ValueError`` for any malformed element or oversized single
+        operation; nothing is stored and no sequence number is consumed.
+        """
+        if not isinstance(operations, list) or not operations:
+            raise ValueError("operations must be a non-empty list")
+        normalized: list[dict] = []
+        for item in operations:
+            if not cls._valid_item(item):
+                raise ValueError(
+                    "each operation must be a dict with op 'put' "
+                    "(keys op, key, value) or 'delete' (keys op, key); "
+                    "key must be a non-empty string and value a string")
+            record = {"op": item["op"], "key": item["key"]}
+            if item["op"] == "put":
+                record["value"] = item["value"]
+            if len(cls._encode(record)) - 4 > PAGE_SIZE:
+                raise ValueError(
+                    "an operation in the batch exceeds the one-record "
+                    f"size limit ({PAGE_SIZE} bytes)")
+            normalized.append(record)
+        return normalized
+
     def write_batch(self, operations: list[dict]) -> list[int]:
         """Atomically append a non-empty batch of put/delete operations.
 
@@ -437,25 +485,57 @@ class PageStore:
         file is left untouched), and ``OSError`` on other read/write
         failures.
         """
-        if not isinstance(operations, list) or not operations:
-            raise ValueError("operations must be a non-empty list")
-        normalized: list[dict] = []
-        for item in operations:
-            if not self._valid_item(item):
-                raise ValueError(
-                    "each operation must be a dict with op 'put' "
-                    "(keys op, key, value) or 'delete' (keys op, key); "
-                    "key must be a non-empty string and value a string")
-            record = {"op": item["op"], "key": item["key"]}
-            if item["op"] == "put":
-                record["value"] = item["value"]
-            if len(self._encode(record)) - 4 > PAGE_SIZE:
-                raise ValueError(
-                    "an operation in the batch exceeds the one-record "
-                    f"size limit ({PAGE_SIZE} bytes)")
-            normalized.append(record)
+        normalized = self._normalize_operations(operations)
         return self._append_record({"op": "batch", "ops": normalized},
                                    len(normalized))
+
+    def write_batch_if(self, expected: dict[str, str | None],
+                       operations: list[dict]) -> list[int] | None:
+        """Commit a batch only if every condition in ``expected`` holds.
+
+        ``expected`` maps keys to the state they must be in at the serial
+        point: a string requires the key's current live value to be exactly
+        equal, ``None`` requires the key to be absent (a deleted key is
+        absent; an empty-string value is not).  Condition keys need not
+        appear in ``operations``, and an empty ``expected`` dict commits
+        unconditionally.  Both arguments are validated wholesale first --
+        ``expected`` must be a dict with non-empty string keys and
+        string-or-``None`` values, and ``operations`` follows the exact
+        ``write_batch`` rules -- so any ``ValueError`` is raised before the
+        store is touched, ahead of every storage error, and leaves the page
+        file and sequence numbers unchanged.
+
+        The condition check and the commit are one serial operation, sharing
+        the coordination lock with every other write, reset, recovery and
+        compaction across instances, threads and processes on this machine:
+        two concurrent calls that both read the same old value and each try
+        to replace it cannot both succeed.  If any condition fails the call
+        returns ``None``: no sequence number is consumed and the page file
+        is left byte-for-byte untouched, including any half-written tail a
+        crashed writer left behind.  On success the batch lands exactly like
+        a ``write_batch`` frame (conditions are not recorded and never count
+        toward the record total) and the operations' consecutive sequence
+        numbers are returned, starting at one past the number of confirmed
+        records at that serial point.
+
+        Raises ``ValueError`` for any malformed argument,
+        ``FileNotFoundError`` when the root is missing, points at a file, or
+        ``pages.dat`` is absent (no storage path is created),
+        ``RuntimeError("corrupt_middle")`` when damage precedes complete
+        records -- even when a condition would have failed -- and
+        ``OSError`` on other read/write failures.
+        """
+        if not isinstance(expected, dict):
+            raise ValueError(
+                "expected must be a dict mapping keys to their required "
+                "current value (a string) or None (key must be absent)")
+        for key, want in expected.items():
+            self._check_key(key)
+            if want is not None and not isinstance(want, str):
+                raise ValueError("expected values must be strings or None")
+        normalized = self._normalize_operations(operations)
+        return self._append_record({"op": "batch", "ops": normalized},
+                                   len(normalized), expected=dict(expected))
 
     # -------------------------------------------------------------- reading
 
